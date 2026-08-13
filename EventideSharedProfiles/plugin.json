@@ -1,0 +1,8 @@
+{
+    "name": "Eventide Shared Profiles",
+    "author": "Eventide Systems",
+    "version": "0.1.0",
+    "api": 8,
+    "description": "Shared profile library and printer/filament capability management for Cura.",
+    "catalog": "cura"
+}
