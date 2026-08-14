@@ -1,0 +1,57 @@
+name: Temporary Eventide beta source bootstrap runner
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  expand:
+    if: github.head_ref == 'bootstrap-v0.7.0-beta'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bootstrap payload
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Reconstruct exact beta files
+        shell: bash
+        run: |
+          python - <<'PY'
+          import base64, lzma, pathlib
+          for parts_dir, output in [
+              ('.bootstrap/py', '/tmp/EventideSharedProfiles.py'),
+              ('.bootstrap/qml', '/tmp/EventideSharedProfilesWindow.qml'),
+          ]:
+              encoded = ''.join(pathlib.Path(p).read_text() for p in sorted(pathlib.Path(parts_dir).glob('part*.txt')))
+              pathlib.Path(output).write_bytes(lzma.decompress(base64.b64decode(encoded)))
+          for name in ['__init__.py', 'plugin.json', 'README.md', 'CHANGELOG.md', 'TESTING.md']:
+              pathlib.Path('/tmp/' + name).write_bytes(pathlib.Path('.bootstrap/files/' + name).read_bytes())
+          PY
+
+      - name: Build expanded beta branch
+        shell: bash
+        run: |
+          git fetch origin main
+          git checkout -B expanded-v0.7.0-beta origin/main
+          rm -rf EventideSharedProfiles .bootstrap
+          rm -f .github/workflows/bootstrap-runner.yml
+          mkdir -p EventideSharedProfiles/qml
+          cp /tmp/EventideSharedProfiles.py EventideSharedProfiles/EventideSharedProfiles.py
+          cp /tmp/EventideSharedProfilesWindow.qml EventideSharedProfiles/qml/EventideSharedProfilesWindow.qml
+          cp /tmp/__init__.py EventideSharedProfiles/__init__.py
+          cp /tmp/plugin.json EventideSharedProfiles/plugin.json
+          cp /tmp/README.md EventideSharedProfiles/README.md
+          cp /tmp/CHANGELOG.md EventideSharedProfiles/CHANGELOG.md
+          cp /tmp/TESTING.md EventideSharedProfiles/TESTING.md
+          cp /tmp/README.md README.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Expanded v0.7.0 beta source"
+          git push --force origin HEAD:expanded-v0.7.0-beta
