@@ -5,6 +5,7 @@ import re
 import socket
 import sys
 import math
+import platform
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, cast
@@ -14,6 +15,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtProperty, pyqtSignal, pyqtSlot
 from UM.Extension import Extension
 from UM.Logger import Logger
 from cura.CuraApplication import CuraApplication
+from cura.CuraVersion import CuraVersion
 from cura.Settings.CuraContainerRegistry import CuraContainerRegistry
 
 
@@ -23,8 +25,10 @@ class EventideSharedProfiles(QObject, Extension):
     stateChanged = pyqtSignal()
 
     CONFIG_FILENAME = "eventide_shared_profiles.json"
+    PLUGIN_VERSION = "0.7.0"
     LIBRARY_FORMAT = 1
     RECORD_FORMAT = 1
+    LIBRARY_POLL_INTERVAL_MS = 3000
 
     def __init__(self) -> None:
         QObject.__init__(self, None)
@@ -56,6 +60,7 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_max_volumetric_flow = ""
         self._capability_max_linear_speed = ""
         self._capability_pressure_advance = ""
+        self._capability_flow_percent = ""
         self._capability_temperature_offset = ""
         self._capability_retraction_distance = ""
         self._capability_retraction_speed = ""
@@ -63,11 +68,13 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_nozzle_material = ""
         self._capability_notes = ""
         self._capability_last_calibrated = ""
+        self._capability_calibration_status = "uncalibrated"
         self._capability_emit_klipper_pa = False
 
         # Active Cura toolhead identity.
         self._active_extruder_position = 0
         self._active_nozzle_diameter = ""
+        self._active_nozzle_material = ""
 
         # Transient slice-time integration state. Eventide never writes these
         # capability values into Cura's persistent userChanges container.
@@ -75,6 +82,10 @@ class EventideSharedProfiles(QObject, Extension):
         self._slice_capability_snapshots: Dict[int, Dict[str, Any]] = {}
         self._last_slice_resolution = "Slice-time hook not checked yet."
         self._last_gcode_guardrail_summary = "No Eventide G-code guardrail run yet."
+        self._toolhead_bindings: Dict[str, str] = {}
+        self._library_manifest_signature: Optional[Tuple[int, int]] = None
+        self._last_library_event = "Library watcher not started yet."
+        self._library_validation_summary = "Library not validated yet."
 
         self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self._legacy_config_path = os.path.join(self._plugin_dir, self.CONFIG_FILENAME)
@@ -90,6 +101,9 @@ class EventideSharedProfiles(QObject, Extension):
 
         self._runtime_hooks_connected = False
         self._slice_hook_retry_count = 0
+        self._library_poll_timer = QTimer(self)
+        self._library_poll_timer.setInterval(self.LIBRARY_POLL_INTERVAL_MS)
+        self._library_poll_timer.timeout.connect(self._poll_shared_library)
 
         # Safe startup activation: only connect the signal here. Do not touch
         # MachineManager, active stacks, or CuraEngine state until Cura tells
@@ -100,11 +114,11 @@ class EventideSharedProfiles(QObject, Extension):
 
         # IMPORTANT: Do not touch MachineManager / active machine state here.
         # Cura loads extensions before all application services are ready.
-        # Runtime hooks are connected lazily the first time the user opens
-        # the Eventide window.
+        # Runtime hooks are armed from initializationFinished, never from the
+        # constructor.
         self.addMenuItem("Eventide Shared Profiles", self.showWindow)
 
-        Logger.log("i", "Eventide Shared Profiles v0.6.2 loaded")
+        Logger.log("i", "Eventide Shared Profiles v%s loaded", self.PLUGIN_VERSION)
 
     def _stable_config_path(self) -> str:
         """Local Eventide config that survives plugin-folder replacement."""
@@ -133,6 +147,13 @@ class EventideSharedProfiles(QObject, Extension):
                 data.get("shared_library_path", "") or ""
             ).strip()
             self._client_id = str(data.get("client_id", "") or "").strip()
+            raw_bindings = data.get("toolhead_bindings", {})
+            if isinstance(raw_bindings, dict):
+                self._toolhead_bindings = {
+                    str(key): str(value).strip()
+                    for key, value in raw_bindings.items()
+                    if str(key).strip() and str(value).strip()
+                }
 
             if source_path == self._legacy_config_path:
                 self._save_config()
@@ -146,9 +167,10 @@ class EventideSharedProfiles(QObject, Extension):
         self._atomic_write_json(
             self._config_path,
             {
-                "format": 2,
+                "format": 3,
                 "shared_library_path": self._shared_library_path,
                 "client_id": self._client_id,
+                "toolhead_bindings": self._toolhead_bindings,
             },
         )
 
@@ -288,11 +310,12 @@ class EventideSharedProfiles(QObject, Extension):
             "limits": {"max_volumetric_flow_mm3_s": None, "max_linear_speed_mm_s": None},
             "tuning": {
                 "pressure_advance": None,
+                "flow_percent": None,
                 "temperature_offset_c": None,
                 "retraction_distance_mm": None,
                 "retraction_speed_mm_s": None,
             },
-            "calibration": {"last_calibrated_utc": None, "notes": ""},
+            "calibration": {"status": "uncalibrated", "last_calibrated_utc": None, "notes": ""},
         }
         self._atomic_write_json(path, record)
         return record, True
@@ -349,6 +372,46 @@ class EventideSharedProfiles(QObject, Extension):
             toolhead_key,
         )
 
+    def _toolhead_binding_key(
+        self,
+        printer_id: str,
+        extruder_position: int,
+        nozzle_diameter: Any,
+    ) -> str:
+        return "{}|extruder-{}|nozzle-{}".format(
+            str(printer_id or "").strip(),
+            int(extruder_position),
+            self._normalize_nozzle_diameter(nozzle_diameter),
+        )
+
+    def _bound_nozzle_material(
+        self,
+        printer_id: str,
+        extruder_position: int,
+        nozzle_diameter: Any,
+    ) -> str:
+        key = self._toolhead_binding_key(
+            printer_id, extruder_position, nozzle_diameter
+        )
+        return str(self._toolhead_bindings.get(key, "") or "").strip()
+
+    def _bind_nozzle_material(
+        self,
+        printer_id: str,
+        extruder_position: int,
+        nozzle_diameter: Any,
+        nozzle_material: str,
+    ) -> None:
+        key = self._toolhead_binding_key(
+            printer_id, extruder_position, nozzle_diameter
+        )
+        material = str(nozzle_material or "").strip()
+        if material:
+            self._toolhead_bindings[key] = material
+        else:
+            self._toolhead_bindings.pop(key, None)
+        self._save_config()
+
     def _active_toolhead(self) -> Tuple[int, Optional[float]]:
         stack = self._get_active_extruder_stack()
         if stack is None:
@@ -404,6 +467,7 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_max_volumetric_flow = ""
         self._capability_max_linear_speed = ""
         self._capability_pressure_advance = ""
+        self._capability_flow_percent = ""
         self._capability_temperature_offset = ""
         self._capability_retraction_distance = ""
         self._capability_retraction_speed = ""
@@ -411,6 +475,7 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_nozzle_material = ""
         self._capability_notes = ""
         self._capability_last_calibrated = ""
+        self._capability_calibration_status = "uncalibrated"
         self._capability_emit_klipper_pa = False
 
     def _set_capability_editor_from_record(self, record: Dict[str, Any]) -> None:
@@ -432,6 +497,9 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_pressure_advance = self._display_number(
             tuning.get("pressure_advance")
         )
+        self._capability_flow_percent = self._display_number(
+            tuning.get("flow_percent")
+        )
         self._capability_temperature_offset = self._display_number(
             tuning.get("temperature_offset_c")
         )
@@ -450,6 +518,9 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_notes = str(calibration.get("notes", "") or "")
         self._capability_last_calibrated = str(
             calibration.get("last_calibrated_utc", "") or ""
+        )
+        self._capability_calibration_status = str(
+            calibration.get("status", "uncalibrated") or "uncalibrated"
         )
         self._capability_emit_klipper_pa = bool(
             tuning.get("emit_klipper_pressure_advance", False)
@@ -537,7 +608,18 @@ class EventideSharedProfiles(QObject, Extension):
         if len(candidates) == 1:
             return candidates[0]
 
-        # If the editor already has a nozzle material, use it to disambiguate.
+        # Prefer the persistent local toolhead binding. Cura tracks nozzle
+        # diameter but generally does not expose nozzle material.
+        bound_material = str(self._active_nozzle_material or "").strip()
+        if bound_material and not preferred_nozzle_material:
+            narrowed = self._capability_candidates(
+                root,
+                preferred_nozzle_material=bound_material,
+            )
+            if len(narrowed) == 1:
+                return narrowed[0]
+
+        # Editor state remains a fallback for legacy local configs.
         editor_material = str(self._capability_nozzle_material or "").strip()
         if editor_material and not preferred_nozzle_material:
             narrowed = self._capability_candidates(
@@ -584,12 +666,14 @@ class EventideSharedProfiles(QObject, Extension):
             },
             "tuning": {
                 "pressure_advance": None,
+                "flow_percent": None,
                 "emit_klipper_pressure_advance": False,
                 "temperature_offset_c": None,
                 "retraction_distance_mm": None,
                 "retraction_speed_mm_s": None,
             },
             "calibration": {
+                "status": "uncalibrated",
                 "last_calibrated_utc": None,
                 "notes": "",
             },
@@ -724,22 +808,41 @@ class EventideSharedProfiles(QObject, Extension):
             )
 
         if len(candidates) > 1:
-            # Cura does not normally know nozzle material. If the Eventide editor
-            # currently has the exact record loaded, that is a safe disambiguator.
-            if self._capability_loaded and self._capability_record_id:
+            # Cura normally knows nozzle diameter but not nozzle material. Eventide
+            # stores a local, per-printer/extruder/nozzle material binding so slice
+            # resolution remains automatic after Cura/plugin restarts.
+            bound_material = self._bound_nozzle_material(
+                printer_id, position, nozzle
+            )
+            chosen_path = None
+            chosen_record = None
+            if bound_material:
+                bound_norm = self._normalize_toolhead_text(bound_material)
+                for path, record in candidates:
+                    record_material = record.get("hotend", {}).get(
+                        "nozzle_material", ""
+                    )
+                    if self._normalize_toolhead_text(record_material) == bound_norm:
+                        if chosen_record is not None:
+                            raise ValueError(
+                                "multiple Eventide capabilities match the bound nozzle material {}".format(
+                                    bound_material
+                                )
+                            )
+                        chosen_path, chosen_record = path, record
+
+            # Editor state remains a backward-compatible fallback for old local
+            # configs that do not have a toolhead binding yet.
+            if chosen_record is None and self._capability_loaded and self._capability_record_id:
                 for path, record in candidates:
                     if str(record.get("id", "") or "") == self._capability_record_id:
                         chosen_path, chosen_record = path, record
                         break
-                else:
-                    raise ValueError(
-                        "multiple Eventide capabilities match this printer/material/nozzle; "
-                        "load the intended nozzle-material capability first"
-                    )
-            else:
+
+            if chosen_record is None:
                 raise ValueError(
                     "multiple Eventide capabilities match this printer/material/nozzle; "
-                    "load the intended nozzle-material capability first"
+                    "set the active nozzle material in Eventide"
                 )
         else:
             chosen_path, chosen_record = candidates[0]
@@ -764,6 +867,31 @@ class EventideSharedProfiles(QObject, Extension):
         limits = record.get("limits", {})
         tuning = record.get("tuning", {})
         changed = []
+
+        # Optional calibrated material-flow multiplier. StartSliceJob has already
+        # resolved Cura setting functions into concrete numbers, so changing only
+        # the parent material_flow value would not recalculate child flow values.
+        # Scale the copied material-flow family together, preserving intentional
+        # per-feature differences from the selected Cura profile.
+        target_flow = tuning.get("flow_percent")
+        if target_flow not in (None, ""):
+            target_flow = float(target_flow)
+            base_flow = self._dict_float(values, "material_flow") or 100.0
+            if base_flow <= 0:
+                base_flow = 100.0
+            scale = target_flow / base_flow
+            for key in list(values.keys()):
+                if key == "material_flow" or key == "material_flow_layer_0" or key.endswith("_material_flow") or key.endswith("_material_flow_layer_0"):
+                    current_value = self._dict_float(values, key)
+                    if current_value is None:
+                        continue
+                    new_value = current_value * scale
+                    values[key] = new_value
+            changed.append(
+                "material flow family scaled to {:g}% (base {:g}%)".format(
+                    target_flow, base_flow
+                )
+            )
 
         max_flow = limits.get("max_volumetric_flow_mm3_s")
         max_linear = limits.get("max_linear_speed_mm_s")
@@ -1236,6 +1364,12 @@ class EventideSharedProfiles(QObject, Extension):
             ";EVENTIDE_PRESSURE_ADVANCE={}".format(
                 tuning.get("pressure_advance", "")
             ),
+            ";EVENTIDE_FLOW_PERCENT={}".format(
+                tuning.get("flow_percent", "")
+            ),
+            ";EVENTIDE_CALIBRATION_STATUS={}".format(
+                record.get("calibration", {}).get("status", "uncalibrated")
+            ),
             ";EVENTIDE_TEMPERATURE_OFFSET_C={}".format(
                 tuning.get("temperature_offset_c", "")
             ),
@@ -1293,9 +1427,19 @@ class EventideSharedProfiles(QObject, Extension):
             if not gcode_list:
                 return
 
-            # Current implementation is single-toolhead safe. For multi-extruder
-            # machines, stamp the lowest-position active Eventide capability and
-            # leave per-tool hard-limit expansion for the next milestone.
+            # G-code-level hard limiting currently tracks one active tool. Do not
+            # guess on a multi-extruder slice: per-extruder transient CuraEngine
+            # settings are already applied, but the final guardrail/PA stamping is
+            # skipped until tool-change-aware G-code enforcement is implemented.
+            if len(self._slice_capability_snapshots) != 1:
+                self._last_gcode_guardrail_summary = (
+                    "MULTI-EXTRUDER: final Eventide G-code guardrail/PA stamp skipped; "
+                    "transient CuraEngine settings only."
+                )
+                Logger.log("w", "Eventide %s", self._last_gcode_guardrail_summary)
+                self.stateChanged.emit()
+                return
+
             position = sorted(self._slice_capability_snapshots.keys())[0]
             snapshot = self._slice_capability_snapshots[position]
             record = snapshot.get("record", {})
@@ -1365,6 +1509,11 @@ class EventideSharedProfiles(QObject, Extension):
         """Arm Eventide automatically once Cura startup is complete."""
         self._slice_hook_retry_count = 0
         self._ensure_runtime_hooks()
+        if not self._library_poll_timer.isActive():
+            self._library_poll_timer.start()
+            self._last_library_event = "Library watcher active ({} s).".format(
+                int(self.LIBRARY_POLL_INTERVAL_MS / 1000)
+            )
 
         # Plugin load ordering can theoretically leave StartSliceJob unavailable
         # on the first initialization callback. Retry briefly without touching
@@ -1398,6 +1547,185 @@ class EventideSharedProfiles(QObject, Extension):
         self._install_slice_settings_hook()
         self._runtime_hooks_connected = True
 
+    def _get_manifest_signature(self) -> Optional[Tuple[int, int]]:
+        if not self._shared_library_path:
+            return None
+        path = self._manifest_path(os.path.normpath(self._shared_library_path))
+        try:
+            stat = os.stat(path)
+            return int(stat.st_mtime_ns), int(stat.st_size)
+        except OSError:
+            return None
+
+    def _poll_shared_library(self) -> None:
+        signature = self._get_manifest_signature()
+        if signature == self._library_manifest_signature:
+            return
+        self._library_manifest_signature = signature
+        try:
+            self._refresh_library_state_internal(require_manifest=False)
+            self._last_library_event = "Shared library changed on disk; inventory refreshed at {}.".format(
+                self._utc_now()
+            )
+            self.stateChanged.emit()
+        except Exception as error:
+            self._last_library_event = "Library watcher error: {}".format(error)
+            Logger.logException("e", "Eventide shared library polling failed")
+            self.stateChanged.emit()
+
+    @pyqtSlot(str, result=str)
+    def setActiveNozzleMaterial(self, nozzle_material: str) -> str:
+        try:
+            self.refreshSelection()
+            if not self._active_printer_id:
+                raise ValueError("Cura does not have an active printer id")
+            position, nozzle = self._active_toolhead()
+            material = str(nozzle_material or "").strip()
+            self._bind_nozzle_material(
+                self._active_printer_id, position, nozzle, material
+            )
+            self._active_nozzle_material = material
+            self._status = (
+                "TOOLHEAD BOUND: extruder {} / nozzle {} mm -> {}".format(
+                    position,
+                    self._display_number(nozzle) or "unknown",
+                    material or "Unspecified",
+                )
+                if material
+                else "TOOLHEAD BINDING CLEARED"
+            )
+        except Exception as error:
+            self._status = "TOOLHEAD BIND FAILED: {}".format(error)
+            Logger.logException("e", "Eventide toolhead binding failed")
+        self.stateChanged.emit()
+        return self._status
+
+    @pyqtSlot(str, result=str)
+    def validateLibrary(self, requested_path: str) -> str:
+        errors = []
+        warnings = []
+        try:
+            root = self._save_library_path_from_ui(requested_path)
+            manifest = self._require_initialized_library(root)
+            if int(manifest.get("record_format", self.RECORD_FORMAT) or 0) > self.RECORD_FORMAT:
+                errors.append("library record format is newer than this plugin")
+
+            expected = {
+                "printers": "eventide.shared_profiles.printer",
+                "filaments": "eventide.shared_profiles.filament",
+                "capabilities": "eventide.shared_profiles.capability",
+            }
+            ids_by_folder: Dict[str, set] = {name: set() for name in expected}
+            records_by_folder: Dict[str, list] = {name: [] for name in expected}
+
+            for folder, schema in expected.items():
+                folder_path = os.path.join(root, folder)
+                if not os.path.isdir(folder_path):
+                    errors.append("missing folder {}".format(folder))
+                    continue
+                for name in sorted(os.listdir(folder_path)):
+                    if not name.lower().endswith(".json"):
+                        continue
+                    path = os.path.join(folder_path, name)
+                    try:
+                        record = self._read_json(path)
+                    except Exception as error:
+                        errors.append("{}: invalid JSON ({})".format(name, error))
+                        continue
+                    if record.get("schema") != schema:
+                        errors.append("{}: schema {}".format(name, record.get("schema")))
+                        continue
+                    record_id = str(record.get("id", "") or "").strip()
+                    if not record_id:
+                        errors.append("{}: missing id".format(name))
+                        continue
+                    if record_id in ids_by_folder[folder]:
+                        errors.append("{}: duplicate id {}".format(name, record_id))
+                    ids_by_folder[folder].add(record_id)
+                    records_by_folder[folder].append((name, record))
+                    try:
+                        if int(record.get("revision", 0) or 0) < 1:
+                            errors.append("{}: invalid revision".format(name))
+                    except Exception:
+                        errors.append("{}: invalid revision".format(name))
+
+            for name, record in records_by_folder["capabilities"]:
+                if record.get("printer_id") not in ids_by_folder["printers"]:
+                    errors.append("{}: missing printer reference".format(name))
+                if record.get("filament_id") not in ids_by_folder["filaments"]:
+                    errors.append("{}: missing filament reference".format(name))
+                hotend = record.get("hotend", {})
+                if hotend.get("nozzle_diameter_mm") in (None, ""):
+                    warnings.append("{}: nozzle diameter unset".format(name))
+                tuning = record.get("tuning", {})
+                if tuning.get("emit_klipper_pressure_advance") and tuning.get("pressure_advance") in (None, ""):
+                    warnings.append("{}: Klipper PA emit enabled but PA is unset".format(name))
+
+            self._refresh_library_state_internal(require_manifest=True)
+            if errors:
+                self._library_validation_summary = "VALIDATION FAILED: {} error(s), {} warning(s). First: {}".format(
+                    len(errors), len(warnings), errors[0]
+                )
+            elif warnings:
+                self._library_validation_summary = "VALIDATION OK WITH WARNINGS: {} warning(s). First: {}".format(
+                    len(warnings), warnings[0]
+                )
+            else:
+                self._library_validation_summary = "VALIDATION OK: library structure and references are consistent."
+            self._status = self._library_validation_summary
+        except Exception as error:
+            self._library_validation_summary = "VALIDATION FAILED: {}".format(error)
+            self._status = self._library_validation_summary
+            Logger.logException("e", "Eventide library validation failed")
+        self.stateChanged.emit()
+        return self._status
+
+    @pyqtSlot(result=str)
+    def exportDiagnostics(self) -> str:
+        try:
+            output_dir = os.path.dirname(self._config_path)
+            os.makedirs(output_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(
+                output_dir, "eventide-diagnostics-{}.txt".format(stamp)
+            )
+            lines = [
+                "Eventide Shared Profiles diagnostics",
+                "generated_utc={}".format(self._utc_now()),
+                "plugin_version={}".format(self.PLUGIN_VERSION),
+                "cura_version={}".format(CuraVersion),
+                "python={}".format(sys.version.replace("\n", " ")),
+                "platform={}".format(platform.platform()),
+                "config_path={}".format(self._config_path),
+                "shared_library_path={}".format(self._shared_library_path),
+                "client_id={}".format(self._client_id),
+                "hostname={}".format(socket.gethostname()),
+                "slice_hook_active={}".format(self._slice_hook_installed),
+                "last_slice_resolution={}".format(self._last_slice_resolution),
+                "last_guardrail={}".format(self._last_gcode_guardrail_summary),
+                "last_library_event={}".format(self._last_library_event),
+                "library_validation={}".format(self._library_validation_summary),
+                "inventory=printers:{},filaments:{},capabilities:{},quality:{}".format(
+                    self._printer_count, self._filament_count, self._capability_count, self._quality_count
+                ),
+                "active_printer_name={}".format(self._active_printer_name),
+                "active_printer_id={}".format(self._active_printer_id),
+                "active_material_name={}".format(self._active_material_name),
+                "active_material_id={}".format(self._active_material_id),
+                "active_extruder={}".format(self._active_extruder_position),
+                "active_nozzle_diameter={}".format(self._active_nozzle_diameter),
+                "active_nozzle_material={}".format(self._active_nozzle_material),
+                "status={}".format(self._status),
+            ]
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+            self._status = "DIAGNOSTICS EXPORTED: {}".format(path)
+        except Exception as error:
+            self._status = "DIAGNOSTICS FAILED: {}".format(error)
+            Logger.logException("e", "Eventide diagnostics export failed")
+        self.stateChanged.emit()
+        return self._status
+
     @pyqtSlot()
     def showWindow(self) -> None:
         self._ensure_runtime_hooks()
@@ -1412,7 +1740,7 @@ class EventideSharedProfiles(QObject, Extension):
 
     @pyqtSlot(result=str)
     def ping(self) -> str:
-        return "Python hook OK — Eventide Shared Profiles v0.6.2"
+        return "Python hook OK — Eventide Shared Profiles v{}".format(self.PLUGIN_VERSION)
 
     @pyqtSlot(str, result=str)
     def saveSharedLibraryPath(self, requested_path: str) -> str:
@@ -1496,6 +1824,7 @@ class EventideSharedProfiles(QObject, Extension):
                     manifest["updated_by"] = self._writer_info()
                     self._atomic_write_json(manifest_path, manifest)
             self._refresh_library_state_internal()
+            self._library_manifest_signature = self._get_manifest_signature()
             self._status = "LIBRARY READY: {}".format(normalized)
         except Exception as error:
             self._status = "INITIALIZE FAILED: {}".format(error)
@@ -1508,6 +1837,7 @@ class EventideSharedProfiles(QObject, Extension):
         try:
             self._save_library_path_from_ui(requested_path)
             self._refresh_library_state_internal(require_manifest=True)
+            self._library_manifest_signature = self._get_manifest_signature()
             self._status = ("LIBRARY REFRESHED: {} printer(s), {} filament(s), "
                             "{} capability record(s), {} quality profile(s).").format(
                 self._printer_count, self._filament_count, self._capability_count, self._quality_count)
@@ -1553,7 +1883,9 @@ class EventideSharedProfiles(QObject, Extension):
                 self._active_material_name,
             )
 
-            candidates = self._capability_candidates(root)
+            candidates = self._capability_candidates(
+                root, preferred_nozzle_material=(self._active_nozzle_material or None)
+            )
             capability_changed = False
 
             if len(candidates) == 1:
@@ -1620,6 +1952,12 @@ class EventideSharedProfiles(QObject, Extension):
             self._touch_manifest(root)
             self._refresh_library_state_internal(require_manifest=True)
             self._set_capability_editor_from_record(record)
+            registered_material = str(record.get("hotend", {}).get("nozzle_material", "") or "").strip()
+            if registered_material and self._active_printer_id:
+                self._bind_nozzle_material(
+                    self._active_printer_id, position, active_nozzle, registered_material
+                )
+                self._active_nozzle_material = registered_material
 
             changed_parts = []
             if printer_changed:
@@ -1662,9 +2000,9 @@ class EventideSharedProfiles(QObject, Extension):
             self.refreshSelection()
 
             preferred_material = (
-                self._capability_nozzle_material
-                if self._capability_loaded
-                else None
+                self._active_nozzle_material
+                or (self._capability_nozzle_material if self._capability_loaded else "")
+                or None
             )
             _, record = self._find_current_capability(
                 root,
@@ -1672,6 +2010,13 @@ class EventideSharedProfiles(QObject, Extension):
             )
 
             self._set_capability_editor_from_record(record)
+            position, active_nozzle = self._active_toolhead()
+            loaded_material = str(record.get("hotend", {}).get("nozzle_material", "") or "").strip()
+            if loaded_material and self._active_printer_id:
+                self._bind_nozzle_material(
+                    self._active_printer_id, position, active_nozzle, loaded_material
+                )
+                self._active_nozzle_material = loaded_material
             self._status = "CAPABILITY LOADED: revision {} | nozzle {} mm / {}".format(
                 self._capability_revision,
                 self._capability_nozzle_diameter or self._active_nozzle_diameter,
@@ -1755,6 +2100,11 @@ class EventideSharedProfiles(QObject, Extension):
                 "Pressure advance",
                 minimum=0.0,
             )
+            tuning["flow_percent"] = self._optional_float(
+                payload.get("flow_percent"),
+                "Material flow",
+                strictly_positive=True,
+            )
             tuning["emit_klipper_pressure_advance"] = bool(
                 payload.get("emit_klipper_pressure_advance", False)
             )
@@ -1789,7 +2139,14 @@ class EventideSharedProfiles(QObject, Extension):
             record["extruder"] = position
 
             calibration["notes"] = str(payload.get("notes", "") or "")
-            calibration["last_calibrated_utc"] = self._utc_now()
+            mark_calibrated = bool(payload.get("mark_calibrated", False))
+            if mark_calibrated:
+                calibration["status"] = "calibrated"
+                calibration["last_calibrated_utc"] = self._utc_now()
+            elif str(calibration.get("status", "uncalibrated") or "uncalibrated") == "calibrated":
+                calibration["status"] = "needs_recalibration"
+            else:
+                calibration.setdefault("status", "uncalibrated")
 
             printer_record_id, filament_record_id = self._base_record_ids()
             canonical_id = self._canonical_capability_id(
@@ -1829,6 +2186,13 @@ class EventideSharedProfiles(QObject, Extension):
 
             self._touch_manifest(root)
             self._set_capability_editor_from_record(record)
+            self._bind_nozzle_material(
+                self._active_printer_id,
+                position,
+                active_nozzle,
+                nozzle_material,
+            )
+            self._active_nozzle_material = nozzle_material
 
             self._status = "CAPABILITY SAVED: revision {} | toolhead {} mm / {}".format(
                 self._capability_revision,
@@ -2046,6 +2410,8 @@ class EventideSharedProfiles(QObject, Extension):
         printer_id = ""
         material_name = "No active material"
         material_id = ""
+        position = 0
+        nozzle: Optional[float] = None
 
         try:
             global_stack = self._application.getGlobalContainerStack()
@@ -2058,9 +2424,6 @@ class EventideSharedProfiles(QObject, Extension):
 
             if active_extruder is not None:
                 position, nozzle = self._active_toolhead()
-                self._active_extruder_position = position
-                self._active_nozzle_diameter = self._display_number(nozzle)
-
                 material = active_extruder.material
 
                 if material is not None:
@@ -2076,17 +2439,30 @@ class EventideSharedProfiles(QObject, Extension):
                 "Eventide Shared Profiles selection refresh failed",
             )
 
+        nozzle_display = self._display_number(nozzle)
+        bound_material = (
+            self._bound_nozzle_material(printer_id, position, nozzle)
+            if printer_id
+            else ""
+        )
+
         changed = (
             printer_name != self._active_printer_name
             or printer_id != self._active_printer_id
             or material_name != self._active_material_name
             or material_id != self._active_material_id
+            or position != self._active_extruder_position
+            or nozzle_display != self._active_nozzle_diameter
+            or bound_material != self._active_nozzle_material
         )
 
         self._active_printer_name = printer_name
         self._active_printer_id = printer_id
         self._active_material_name = material_name
         self._active_material_id = material_id
+        self._active_extruder_position = position
+        self._active_nozzle_diameter = nozzle_display
+        self._active_nozzle_material = bound_material
 
         if changed:
             self._clear_capability_editor()
@@ -2205,6 +2581,10 @@ class EventideSharedProfiles(QObject, Extension):
         return self._capability_pressure_advance
 
     @pyqtProperty(str, notify=stateChanged)
+    def capabilityFlowPercent(self) -> str:
+        return self._capability_flow_percent
+
+    @pyqtProperty(str, notify=stateChanged)
     def capabilityTemperatureOffset(self) -> str:
         return self._capability_temperature_offset
 
@@ -2233,6 +2613,10 @@ class EventideSharedProfiles(QObject, Extension):
         return self._capability_last_calibrated
 
 
+    @pyqtProperty(str, notify=stateChanged)
+    def capabilityCalibrationStatus(self) -> str:
+        return self._capability_calibration_status
+
     @pyqtProperty(bool, notify=stateChanged)
     def capabilityEmitKlipperPA(self) -> bool:
         return self._capability_emit_klipper_pa
@@ -2244,6 +2628,10 @@ class EventideSharedProfiles(QObject, Extension):
     @pyqtProperty(str, notify=stateChanged)
     def activeNozzleDiameter(self) -> str:
         return self._active_nozzle_diameter
+
+    @pyqtProperty(str, notify=stateChanged)
+    def activeNozzleMaterial(self) -> str:
+        return self._active_nozzle_material
 
     @pyqtProperty(bool, notify=stateChanged)
     def sliceHookInstalled(self) -> bool:
@@ -2261,3 +2649,11 @@ class EventideSharedProfiles(QObject, Extension):
     @pyqtProperty(str, notify=stateChanged)
     def lastGcodeGuardrailSummary(self) -> str:
         return self._last_gcode_guardrail_summary
+
+    @pyqtProperty(str, notify=stateChanged)
+    def lastLibraryEvent(self) -> str:
+        return self._last_library_event
+
+    @pyqtProperty(str, notify=stateChanged)
+    def libraryValidationSummary(self) -> str:
+        return self._library_validation_summary
