@@ -1,8 +1,8 @@
 {
     "name": "Eventide Shared Profiles",
     "author": "Eventide Systems",
-    "version": "0.1.0",
+    "version": "0.6.2",
     "api": 8,
-    "description": "Shared profile library and printer/filament capability management for Cura.",
+    "description": "Shared Cura profile library with automatically armed transient slice-time printer/material/toolhead capabilities and G-code hard-limit enforcement.",
     "catalog": "cura"
 }
