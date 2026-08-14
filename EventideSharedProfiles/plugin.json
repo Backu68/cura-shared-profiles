@@ -1,8 +1,8 @@
 {
     "name": "Eventide Shared Profiles",
     "author": "Eventide Systems",
-    "version": "0.7.0",
+    "version": "0.6.2",
     "api": 8,
-    "description": "Beta shared Cura profile library with transient printer/material/toolhead capability enforcement, persistent nozzle-material binding, library validation, live NAS refresh, and diagnostics. Targeted at Cura 5.13.0.",
+    "description": "Shared Cura profile library with automatically armed transient slice-time printer/material/toolhead capabilities and G-code hard-limit enforcement.",
     "catalog": "cura"
 }
