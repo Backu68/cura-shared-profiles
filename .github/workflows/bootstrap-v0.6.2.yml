@@ -1,0 +1,78 @@
+name: Bootstrap v0.6.2 source
+
+on:
+  push:
+    branches:
+      - bootstrap-v0.6.2
+    paths:
+      - '.github/workflows/bootstrap-v0.6.2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bootstrap payload
+        uses: actions/checkout@v4
+
+      - name: Reconstruct tested source
+        shell: bash
+        run: |
+          python - <<'PY'
+          import base64, lzma, pathlib
+          for parts_dir, output in [
+              ('.bootstrap/py', '/tmp/EventideSharedProfiles.py'),
+              ('.bootstrap/qml', '/tmp/EventideSharedProfilesWindow.qml'),
+          ]:
+              encoded = ''.join(pathlib.Path(p).read_text() for p in sorted(pathlib.Path(parts_dir).glob('part*.txt')))
+              pathlib.Path(output).write_bytes(lzma.decompress(base64.b64decode(encoded)))
+          PY
+
+      - name: Commit v0.6.2 to main
+        shell: bash
+        run: |
+          git fetch origin main
+          git checkout main
+          rm -rf EventideSharedProfiles
+          mkdir -p EventideSharedProfiles/qml
+          cp /tmp/EventideSharedProfiles.py EventideSharedProfiles/EventideSharedProfiles.py
+          cp /tmp/EventideSharedProfilesWindow.qml EventideSharedProfiles/qml/EventideSharedProfilesWindow.qml
+          cat > EventideSharedProfiles/__init__.py <<'EOF'
+          from . import EventideSharedProfiles
+
+
+          def getMetaData():
+              return {}
+
+
+          def register(app):
+              return {"extension": EventideSharedProfiles.EventideSharedProfiles()}
+          EOF
+          cat > EventideSharedProfiles/plugin.json <<'EOF'
+          {
+              "name": "Eventide Shared Profiles",
+              "author": "Eventide Systems",
+              "version": "0.6.2",
+              "api": 8,
+              "description": "Shared Cura profile library with automatically armed transient slice-time printer/material/toolhead capabilities and G-code hard-limit enforcement.",
+              "catalog": "cura"
+          }
+          EOF
+          cat > README.md <<'EOF'
+          # Eventide Shared Profiles for Cura
+
+          Shared printer/material capability management for UltiMaker Cura.
+
+          ## v0.6.2 checkpoint
+
+          This commit preserves the last tested pre-beta checkpoint. It includes automatic transient slice-time capability resolution, non-persistent CuraEngine setting injection, single-extruder G-code hard ceilings for linear and volumetric flow, temperature offset, retraction overrides, and optional Klipper pressure advance.
+
+          Target: UltiMaker Cura 5.13.x / Plugin API 8.
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Release v0.6.2 checkpoint"
+          git push origin main
