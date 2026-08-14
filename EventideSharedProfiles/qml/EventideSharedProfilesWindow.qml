@@ -22,6 +22,7 @@ Window {
         maxFlow.text = eventideBridge.capabilityMaxVolumetricFlow
         maxSpeed.text = eventideBridge.capabilityMaxLinearSpeed
         pressureAdvance.text = eventideBridge.capabilityPressureAdvance
+        materialFlow.text = eventideBridge.capabilityFlowPercent
         tempOffset.text = eventideBridge.capabilityTemperatureOffset
         retractDistance.text = eventideBridge.capabilityRetractionDistance
         retractSpeed.text = eventideBridge.capabilityRetractionSpeed
@@ -29,6 +30,7 @@ Window {
         nozzleMaterial.text = eventideBridge.capabilityNozzleMaterial
         klipperPa.checked = eventideBridge.capabilityEmitKlipperPA
         capabilityNotes.text = eventideBridge.capabilityNotes
+        markCalibrated.checked = false
     }
 
     function loadCapability() {
@@ -44,13 +46,15 @@ Window {
             "max_volumetric_flow_mm3_s": maxFlow.text,
             "max_linear_speed_mm_s": maxSpeed.text,
             "pressure_advance": pressureAdvance.text,
+            "flow_percent": materialFlow.text,
             "emit_klipper_pressure_advance": klipperPa.checked,
             "temperature_offset_c": tempOffset.text,
             "retraction_distance_mm": retractDistance.text,
             "retraction_speed_mm_s": retractSpeed.text,
             "nozzle_diameter_mm": nozzleDiameter.text,
             "nozzle_material": nozzleMaterial.text,
-            "notes": capabilityNotes.text
+            "notes": capabilityNotes.text,
+            "mark_calibrated": markCalibrated.checked
         }
 
         uiStatus = eventideBridge.saveCurrentCapability(
@@ -65,6 +69,7 @@ Window {
 
     Component.onCompleted: {
         libraryPath.text = eventideBridge.sharedLibraryPath
+        toolheadMaterial.text = eventideBridge.activeNozzleMaterial
         uiStatus = eventideBridge.ping()
     }
 
@@ -87,7 +92,7 @@ Window {
                 }
 
                 Label {
-                    text: "v0.6.2 — transient slice integration"
+                    text: "v0.7.0 beta — release hardening"
                     color: UM.Theme.getColor("text")
                     opacity: 0.7
                 }
@@ -126,6 +131,7 @@ Window {
             TabButton { text: "Library" }
             TabButton { text: "Current Selection" }
             TabButton { text: "Capability" }
+            TabButton { text: "Diagnostics" }
         }
 
         StackLayout {
@@ -177,6 +183,10 @@ Window {
                                     text: "Refresh Library"
                                     onClicked: uiStatus = eventideBridge.refreshLibrary(libraryPath.text)
                                 }
+                                Button {
+                                    text: "Validate Library"
+                                    onClicked: uiStatus = eventideBridge.validateLibrary(libraryPath.text)
+                                }
                                 Item { Layout.fillWidth: true }
                             }
                         }
@@ -203,6 +213,28 @@ Window {
 
                             Label { text: "Quality Profiles"; font.bold: true; color: UM.Theme.getColor("text") }
                             Label { text: eventideBridge.qualityCount.toString(); color: UM.Theme.getColor("text") }
+                        }
+                    }
+
+                    GroupBox {
+                        title: "Live Library Watch"
+                        Layout.fillWidth: true
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            Label {
+                                text: eventideBridge.lastLibraryEvent
+                                color: UM.Theme.getColor("text")
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+                            Label {
+                                text: eventideBridge.libraryValidationSummary
+                                color: UM.Theme.getColor("text")
+                                opacity: 0.75
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
                         }
                     }
 
@@ -295,6 +327,30 @@ Window {
                             }
 
                             RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+
+                                Label {
+                                    text: "Active nozzle material"
+                                    font.bold: true
+                                    color: UM.Theme.getColor("text")
+                                }
+                                TextField {
+                                    id: toolheadMaterial
+                                    Layout.fillWidth: true
+                                    placeholderText: "e.g. Brass"
+                                    selectByMouse: true
+                                }
+                                Button {
+                                    text: "Bind Toolhead"
+                                    onClicked: {
+                                        uiStatus = eventideBridge.setActiveNozzleMaterial(toolheadMaterial.text)
+                                        toolheadMaterial.text = eventideBridge.activeNozzleMaterial
+                                    }
+                                }
+                            }
+
+                            RowLayout {
                                 spacing: 8
 
                                 Button {
@@ -311,6 +367,7 @@ Window {
                                     text: "Reload Current Selection"
                                     onClicked: {
                                         eventideBridge.refreshSelection()
+                                        toolheadMaterial.text = eventideBridge.activeNozzleMaterial
                                         loadCapability()
                                     }
                                 }
@@ -349,6 +406,13 @@ Window {
                         }
 
                         Item { Layout.fillWidth: true }
+
+                        Label {
+                            text: "Calibration: " + eventideBridge.capabilityCalibrationStatus
+                            color: UM.Theme.getColor("text")
+                            font.bold: true
+                            opacity: 0.85
+                        }
 
                         Label {
                             text: eventideBridge.capabilityLastCalibrated.length > 0
@@ -392,6 +456,14 @@ Window {
                                         id: maxSpeed
                                         Layout.fillWidth: true
                                         placeholderText: "unset"
+                                        selectByMouse: true
+                                    }
+
+                                    Label { text: "Material flow (%)"; color: UM.Theme.getColor("text") }
+                                    TextField {
+                                        id: materialFlow
+                                        Layout.fillWidth: true
+                                        placeholderText: "unset / inherit Cura"
                                         selectByMouse: true
                                     }
 
@@ -536,16 +608,36 @@ Window {
                             }
 
                             GroupBox {
-                                title: "Calibration Notes"
+                                title: "Calibration"
                                 Layout.fillWidth: true
 
-                                TextArea {
-                                    id: capabilityNotes
+                                ColumnLayout {
                                     anchors.fill: parent
-                                    implicitHeight: 100
-                                    placeholderText: "Optional calibration notes"
-                                    selectByMouse: true
-                                    wrapMode: TextEdit.Wrap
+                                    spacing: 8
+
+                                    TextArea {
+                                        id: capabilityNotes
+                                        Layout.fillWidth: true
+                                        implicitHeight: 100
+                                        placeholderText: "Optional calibration notes"
+                                        selectByMouse: true
+                                        wrapMode: TextEdit.Wrap
+                                    }
+
+                                    CheckBox {
+                                        id: markCalibrated
+                                        text: "Mark this save as calibrated"
+                                    }
+
+                                    Label {
+                                        text: "Normal saves no longer change the calibration timestamp. "
+                                              + "If a previously calibrated capability is edited without this box, "
+                                              + "its status becomes needs_recalibration."
+                                        color: UM.Theme.getColor("text")
+                                        opacity: 0.7
+                                        wrapMode: Text.WordWrap
+                                        Layout.fillWidth: true
+                                    }
                                 }
                             }
 
@@ -585,6 +677,88 @@ Window {
                             horizontalAlignment: Text.AlignRight
                         }
                     }
+                }
+            }
+
+            // ----------------------------------------------------------
+            // Diagnostics tab
+            // ----------------------------------------------------------
+            Item {
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 12
+
+                    GroupBox {
+                        title: "Beta Safety / Runtime"
+                        Layout.fillWidth: true
+
+                        GridLayout {
+                            anchors.fill: parent
+                            columns: 2
+                            columnSpacing: 18
+                            rowSpacing: 8
+
+                            Label { text: "Slice hook"; font.bold: true; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.sliceHookActive ? "ACTIVE" : "NOT ACTIVE"; color: UM.Theme.getColor("text") }
+
+                            Label { text: "Last slice"; font.bold: true; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.lastSliceResolution; color: UM.Theme.getColor("text"); wrapMode: Text.WordWrap; Layout.fillWidth: true }
+
+                            Label { text: "G-code guardrail"; font.bold: true; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.lastGcodeGuardrailSummary; color: UM.Theme.getColor("text"); wrapMode: Text.WordWrap; Layout.fillWidth: true }
+
+                            Label { text: "Library watcher"; font.bold: true; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.lastLibraryEvent; color: UM.Theme.getColor("text"); wrapMode: Text.WordWrap; Layout.fillWidth: true }
+
+                            Label { text: "Library validation"; font.bold: true; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.libraryValidationSummary; color: UM.Theme.getColor("text"); wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                        }
+                    }
+
+                    GroupBox {
+                        title: "Bug Report Tools"
+                        Layout.fillWidth: true
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            spacing: 8
+
+                            Label {
+                                text: "Export Diagnostics writes a local text report containing plugin/runtime state, "
+                                      + "selection IDs, library path, and the last resolver/guardrail results. Review it "
+                                      + "before sharing if the library path or host name is sensitive."
+                                color: UM.Theme.getColor("text")
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+
+                            RowLayout {
+                                Button {
+                                    text: "Validate Library"
+                                    onClicked: uiStatus = eventideBridge.validateLibrary(libraryPath.text)
+                                }
+                                Button {
+                                    text: "Export Diagnostics"
+                                    onClicked: uiStatus = eventideBridge.exportDiagnostics()
+                                }
+                                Item { Layout.fillWidth: true }
+                            }
+                        }
+                    }
+
+                    GroupBox {
+                        title: "Known Beta Limitation"
+                        Layout.fillWidth: true
+                        Label {
+                            anchors.fill: parent
+                            text: "Final G-code hard-limit enforcement and Klipper PA stamping are currently single-extruder only. "
+                                  + "On multi-extruder slices Eventide applies transient CuraEngine settings per extruder but safely skips the final G-code guardrail/PA stamp rather than guessing."
+                            color: UM.Theme.getColor("text")
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+
+                    Item { Layout.fillHeight: true }
                 }
             }
         }
