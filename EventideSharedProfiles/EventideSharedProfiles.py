@@ -5,6 +5,7 @@ import re
 import socket
 import sys
 import math
+import platform
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, cast
@@ -14,6 +15,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtProperty, pyqtSignal, pyqtSlot
 from UM.Extension import Extension
 from UM.Logger import Logger
 from cura.CuraApplication import CuraApplication
+from cura.CuraVersion import CuraVersion
 from cura.Settings.CuraContainerRegistry import CuraContainerRegistry
 
 
@@ -23,8 +25,10 @@ class EventideSharedProfiles(QObject, Extension):
     stateChanged = pyqtSignal()
 
     CONFIG_FILENAME = "eventide_shared_profiles.json"
+    PLUGIN_VERSION = "0.7.0"
     LIBRARY_FORMAT = 1
     RECORD_FORMAT = 1
+    LIBRARY_POLL_INTERVAL_MS = 3000
 
     def __init__(self) -> None:
         QObject.__init__(self, None)
@@ -56,6 +60,7 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_max_volumetric_flow = ""
         self._capability_max_linear_speed = ""
         self._capability_pressure_advance = ""
+        self._capability_flow_percent = ""
         self._capability_temperature_offset = ""
         self._capability_retraction_distance = ""
         self._capability_retraction_speed = ""
@@ -63,11 +68,13 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_nozzle_material = ""
         self._capability_notes = ""
         self._capability_last_calibrated = ""
+        self._capability_calibration_status = "uncalibrated"
         self._capability_emit_klipper_pa = False
 
         # Active Cura toolhead identity.
         self._active_extruder_position = 0
         self._active_nozzle_diameter = ""
+        self._active_nozzle_material = ""
 
         # Transient slice-time integration state. Eventide never writes these
         # capability values into Cura's persistent userChanges container.
@@ -75,6 +82,10 @@ class EventideSharedProfiles(QObject, Extension):
         self._slice_capability_snapshots: Dict[int, Dict[str, Any]] = {}
         self._last_slice_resolution = "Slice-time hook not checked yet."
         self._last_gcode_guardrail_summary = "No Eventide G-code guardrail run yet."
+        self._toolhead_bindings: Dict[str, str] = {}
+        self._library_manifest_signature: Optional[Tuple[int, int]] = None
+        self._last_library_event = "Library watcher not started yet."
+        self._library_validation_summary = "Library not validated yet."
 
         self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self._legacy_config_path = os.path.join(self._plugin_dir, self.CONFIG_FILENAME)
@@ -90,6 +101,9 @@ class EventideSharedProfiles(QObject, Extension):
 
         self._runtime_hooks_connected = False
         self._slice_hook_retry_count = 0
+        self._library_poll_timer = QTimer(self)
+        self._library_poll_timer.setInterval(self.LIBRARY_POLL_INTERVAL_MS)
+        self._library_poll_timer.timeout.connect(self._poll_shared_library)
 
         # Safe startup activation: only connect the signal here. Do not touch
         # MachineManager, active stacks, or CuraEngine state until Cura tells
@@ -100,11 +114,11 @@ class EventideSharedProfiles(QObject, Extension):
 
         # IMPORTANT: Do not touch MachineManager / active machine state here.
         # Cura loads extensions before all application services are ready.
-        # Runtime hooks are connected lazily the first time the user opens
-        # the Eventide window.
+        # Runtime hooks are armed from initializationFinished, never from the
+        # constructor.
         self.addMenuItem("Eventide Shared Profiles", self.showWindow)
 
-        Logger.log("i", "Eventide Shared Profiles v0.6.2 loaded")
+        Logger.log("i", "Eventide Shared Profiles v%s loaded", self.PLUGIN_VERSION)
 
     def _stable_config_path(self) -> str:
         """Local Eventide config that survives plugin-folder replacement."""
@@ -133,6 +147,13 @@ class EventideSharedProfiles(QObject, Extension):
                 data.get("shared_library_path", "") or ""
             ).strip()
             self._client_id = str(data.get("client_id", "") or "").strip()
+            raw_bindings = data.get("toolhead_bindings", {})
+            if isinstance(raw_bindings, dict):
+                self._toolhead_bindings = {
+                    str(key): str(value).strip()
+                    for key, value in raw_bindings.items()
+                    if str(key).strip() and str(value).strip()
+                }
 
             if source_path == self._legacy_config_path:
                 self._save_config()
@@ -146,9 +167,10 @@ class EventideSharedProfiles(QObject, Extension):
         self._atomic_write_json(
             self._config_path,
             {
-                "format": 2,
+                "format": 3,
                 "shared_library_path": self._shared_library_path,
                 "client_id": self._client_id,
+                "toolhead_bindings": self._toolhead_bindings,
             },
         )
 
@@ -218,7 +240,7 @@ class EventideSharedProfiles(QObject, Extension):
         if manifest.get("schema") != "eventide.shared_profiles.library":
             raise ValueError("Library manifest has an unexpected schema")
         if int(manifest.get("format", 0)) != self.LIBRARY_FORMAT:
-            raisY = "Library format is not supported"
+            raiseY = "Library format is not supported"
             raise ValueError(raiseY)
 
     @pyqtSlot(str)
@@ -234,7 +256,7 @@ class EventideSharedProfiles(QObject, Extension):
             return "ACTIVE"
         return "NOT ACTIVE"
 
-    @pyqtSlot()r
+    @pyqtSlot()
     def _on_cura_initialized(self) -> None:
         """Cura has finished booting; arm slice hooks safely now."""
         try:
@@ -247,10 +269,15 @@ class EventideSharedProfiles(QObject, Extension):
                 "e", "Eventide startup slice-hook activation failed"
             )
             self._schedule_slice_hook_retry()
+        try:
+            self._library_manifest_signature = self._library_signature()
+            self._library_poll_timer.start()
+        except Exception:
+            Logger.logException("e", "Eventide library watcher start failed")
         self.stateChanged.emit()
 
     def _schedule_slice_hook_retry(self) -> None:
         if self._slice_hook_installed:
             return
         if self._slice_hook_retry_count >= 20:
-            Logger.log("e", "Eventide gaã}8éÈZ®Ëkºwµç
+            Logger.log("e", "Eventide gaÛ¯zÙÈZ®Ëkºwµç
