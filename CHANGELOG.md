@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1-beta
+- Publish portable custom Cura material XML during registration.
+- Import missing published materials on another Cura install while preserving material GUID identity.
+- Publish machine-instance base definition ID and `definitionChanges` without transient slicing/user overrides.
+- Recreate missing machine instances when the target Cura has the same base definition.
+- Persist local Eventide-to-Cura machine bindings to avoid duplicate recreation.
+- Add explicit **Sync Library to Cura** action, sync diagnostics, payload hash validation, and safe failure for missing base machine definitions.
+
 ## 0.7.0 Beta
 
 - Added material flow (%) capability field and transient CuraEngine propagation.

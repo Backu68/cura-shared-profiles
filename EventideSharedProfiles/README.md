@@ -1,4 +1,4 @@
-# Eventide Shared Profiles 0.7.0 Beta
+# Eventide Shared Profiles 0.7.1 Beta
 
 Eventide Shared Profiles is an early beta plugin for UltiMaker Cura 5.13.0.
 
@@ -7,6 +7,8 @@ Eventide Shared Profiles is an early beta plugin for UltiMaker Cura 5.13.0.
 Currently working:
 
 - shared printer/material identity records
+- portable custom-material publish/import with preserved Cura GUID
+- machine-instance publish/recreation when the target Cura has the same base definition
 - printer + material + extruder + nozzle capability records
 - transient slice-time capability injection without persistent Cura `userChanges`
 - max linear-speed and max volumetric-flow enforcement
@@ -24,8 +26,8 @@ Currently working:
 
 Not finished yet:
 
-- recreating/synchronizing complete Cura printer definitions on another computer
-- recreating/synchronizing complete Cura custom material definitions on another computer
+- syncing third-party custom machine definition files that are not already installed on the target Cura
+- automatic background installation (v0.7.1 uses an explicit **Sync Library to Cura** action)
 - shared quality-profile capture/application
 - edit lock/lease UI (revision conflicts already prevent stale overwrites)
 - final G-code hard-limit/PA stamping for multi-extruder slices
@@ -50,3 +52,7 @@ Review exported diagnostics before sharing; it includes local host, selection ID
 ## Wider beta testing
 
 See `TESTING.md` for the repeatable no-printer-required regression matrix.
+
+## Cross-PC sync (0.7.1)
+
+On the source Cura install, select the custom material and printer and click **Register Current Selection**. Eventide upgrades the shared filament record with Cura's serialized material definition and the printer record with machine `definitionChanges`. On another Cura install, click **Sync Library to Cura**. Missing custom materials are imported while preserving their GUID. Missing machine instances are recreated from the same installed base definition and receive the published machine definition changes. Temporary quality/user slicing overrides are intentionally not copied.

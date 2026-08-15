@@ -92,7 +92,7 @@ Window {
                 }
 
                 Label {
-                    text: "v0.7.0 beta — release hardening"
+                    text: "v0.7.1 beta — release hardening"
                     color: UM.Theme.getColor("text")
                     opacity: 0.7
                 }
@@ -189,6 +189,25 @@ Window {
                                 }
                                 Item { Layout.fillWidth: true }
                             }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+
+                                Button {
+                                    text: "Sync Library to Cura"
+                                    onClicked: {
+                                        uiStatus = eventideBridge.syncLibraryToCura(libraryPath.text)
+                                        eventideBridge.refreshSelection()
+                                    }
+                                }
+                                Label {
+                                    text: "Installs missing published materials and recreates missing machine instances. Does not copy temporary slicing overrides."
+                                    color: UM.Theme.getColor("text")
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
+                                }
+                            }
                         }
                     }
 
@@ -213,6 +232,21 @@ Window {
 
                             Label { text: "Quality Profiles"; font.bold: true; color: UM.Theme.getColor("text") }
                             Label { text: eventideBridge.qualityCount.toString(); color: UM.Theme.getColor("text") }
+                        }
+                    }
+
+                    GroupBox {
+                        title: "Cura Sync"
+                        Layout.fillWidth: true
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            Label {
+                                text: eventideBridge.lastSyncSummary
+                                color: UM.Theme.getColor("text")
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
                         }
                     }
 
