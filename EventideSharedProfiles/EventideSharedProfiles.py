@@ -25,7 +25,7 @@ class EventideSharedProfiles(QObject, Extension):
     stateChanged = pyqtSignal()
 
     CONFIG_FILENAME = "eventide_shared_profiles.json"
-    PLUGIN_VERSION = "0.7.0"
+    PLUGIN_VERSION = "0.7.1"
     LIBRARY_FORMAT = 1
     RECORD_FORMAT = 1
     LIBRARY_POLL_INTERVAL_MS = 3000
@@ -86,6 +86,8 @@ class EventideSharedProfiles(QObject, Extension):
         self._library_manifest_signature: Optional[Tuple[int, int]] = None
         self._last_library_event = "Library watcher not started yet."
         self._library_validation_summary = "Library not validated yet."
+        self._last_sync_summary = "Library has not been synchronized to this Cura install yet."
+        self._machine_bindings: Dict[str, str] = {}
 
         self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self._legacy_config_path = os.path.join(self._plugin_dir, self.CONFIG_FILENAME)
@@ -154,6 +156,13 @@ class EventideSharedProfiles(QObject, Extension):
                     for key, value in raw_bindings.items()
                     if str(key).strip() and str(value).strip()
                 }
+            raw_machine_bindings = data.get("machine_bindings", {})
+            if isinstance(raw_machine_bindings, dict):
+                self._machine_bindings = {
+                    str(key): str(value).strip()
+                    for key, value in raw_machine_bindings.items()
+                    if str(key).strip() and str(value).strip()
+                }
 
             if source_path == self._legacy_config_path:
                 self._save_config()
@@ -167,10 +176,11 @@ class EventideSharedProfiles(QObject, Extension):
         self._atomic_write_json(
             self._config_path,
             {
-                "format": 3,
+                "format": 4,
                 "shared_library_path": self._shared_library_path,
                 "client_id": self._client_id,
                 "toolhead_bindings": self._toolhead_bindings,
+                "machine_bindings": self._machine_bindings,
             },
         )
 
@@ -283,6 +293,149 @@ class EventideSharedProfiles(QObject, Extension):
         }
         self._atomic_write_json(path, record)
         return record, True
+
+    @staticmethod
+    def _json_safe_value(value: Any) -> Any:
+        """Return a JSON-safe representation without evaluating arbitrary objects."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (list, tuple)):
+            return [EventideSharedProfiles._json_safe_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): EventideSharedProfiles._json_safe_value(item)
+                for key, item in value.items()
+            }
+        return str(value)
+
+    def _instance_values(self, container: Any) -> Dict[str, Any]:
+        values: Dict[str, Any] = {}
+        if container is None:
+            return values
+        try:
+            keys = container.getAllKeys()
+        except Exception:
+            return values
+        for key in keys:
+            try:
+                values[str(key)] = self._json_safe_value(
+                    container.getProperty(key, "value")
+                )
+            except Exception:
+                Logger.logException("w", "Eventide could not snapshot setting %s", key)
+        return values
+
+    def _capture_active_material_definition(self) -> Dict[str, Any]:
+        """Serialize the logical root material so another Cura can import it."""
+        stack = self._get_active_extruder_stack()
+        if stack is None:
+            raise ValueError("Cura has no active extruder stack")
+        material = getattr(stack, "material", None)
+        if material is None:
+            raise ValueError("Cura has no active material")
+
+        registry = CuraContainerRegistry.getInstance()
+        base_file = ""
+        guid = ""
+        try:
+            base_file = str(material.getMetaDataEntry("base_file", "") or "").strip()
+            guid = str(material.getMetaDataEntry("GUID", "") or "").strip()
+        except Exception:
+            pass
+        root = material
+        if base_file:
+            try:
+                roots = registry.findInstanceContainers(id=base_file)
+                if roots:
+                    root = roots[0]
+            except Exception:
+                pass
+        if not guid:
+            try:
+                guid = str(root.getMetaDataEntry("GUID", "") or "").strip()
+            except Exception:
+                pass
+
+        root_id = str(root.getId() or "").strip()
+        readonly = False
+        try:
+            readonly = bool(registry.isReadOnly(root_id))
+        except Exception:
+            pass
+
+        metadata: Dict[str, Any] = {}
+        try:
+            raw_metadata = root.getMetaData()
+            if isinstance(raw_metadata, dict):
+                for key in ("GUID", "base_file", "name", "brand", "material", "color_name", "color_code", "diameter", "setting_version"):
+                    if key in raw_metadata:
+                        metadata[key] = self._json_safe_value(raw_metadata.get(key))
+        except Exception:
+            pass
+
+        serialized = ""
+        if not readonly:
+            serialized = str(root.serialize() or "")
+            if not serialized.strip():
+                raise ValueError("active custom material could not be serialized")
+
+        return {
+            "format": "cura_material_xml_v1",
+            "guid": guid,
+            "source_container_id": root_id,
+            "source_base_file": base_file or root_id,
+            "name": str(root.getName() or self._active_material_name),
+            "readonly_builtin": readonly,
+            "metadata": metadata,
+            "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest() if serialized else "",
+            "serialized": serialized,
+        }
+
+    def _capture_active_machine_definition(self) -> Dict[str, Any]:
+        """Capture machine-instance definition changes, not transient slicing userChanges."""
+        global_stack = self._application.getGlobalContainerStack()
+        if global_stack is None:
+            raise ValueError("Cura has no active machine stack")
+
+        definition = getattr(global_stack, "definition", None)
+        if definition is None:
+            raise ValueError("active machine has no definition")
+
+        extruders = []
+        for extruder in list(getattr(global_stack, "extruderList", []) or []):
+            position = 0
+            try:
+                position = int(extruder.getMetaDataEntry("position") or 0)
+            except Exception:
+                pass
+            extruder_definition = getattr(extruder, "definition", None)
+            extruders.append({
+                "position": position,
+                "definition_id": str(extruder_definition.getId() if extruder_definition is not None else ""),
+                "definition_changes": self._instance_values(getattr(extruder, "definitionChanges", None)),
+                "enabled": bool(getattr(extruder, "isEnabled", True)),
+            })
+
+        return {
+            "format": "cura_machine_instance_v1",
+            "source_stack_id": str(global_stack.getId() or ""),
+            "name": str(global_stack.getName() or self._active_printer_name),
+            "definition_id": str(definition.getId() or ""),
+            "definition_name": str(definition.getName() or ""),
+            "global_definition_changes": self._instance_values(getattr(global_stack, "definitionChanges", None)),
+            "extruders": sorted(extruders, key=lambda item: int(item.get("position", 0))),
+        }
+
+    def _update_record_section(self, path: str, section: str, payload: Dict[str, Any]) -> bool:
+        record = self._read_json(path)
+        if record.get(section) == payload:
+            return False
+        record[section] = payload
+        record["revision"] = int(record.get("revision", 0) or 0) + 1
+        record["updated_utc"] = self._utc_now()
+        record["updated_by"] = self._writer_info()
+        self._atomic_write_json(path, record)
+        return True
 
     def _capability_upsert(self, path: str, capability_id: str,
                            printer_record_id: str, filament_record_id: str) -> Tuple[Dict[str, Any], bool]:
@@ -1600,6 +1753,256 @@ class EventideSharedProfiles(QObject, Extension):
         self.stateChanged.emit()
         return self._status
 
+    def _material_guid_exists_locally(self, guid: str) -> bool:
+        if not str(guid or "").strip():
+            return False
+        try:
+            return bool(CuraContainerRegistry.getInstance().findInstanceContainersMetadata(GUID=str(guid).strip()))
+        except Exception:
+            return False
+
+    def _install_material_record(self, record: Dict[str, Any]) -> str:
+        definition = record.get("material_definition", {})
+        if not isinstance(definition, dict):
+            return "unpublished"
+        guid = str(definition.get("guid", "") or "").strip()
+        if guid and self._material_guid_exists_locally(guid):
+            return "existing"
+        if bool(definition.get("readonly_builtin", False)):
+            return "builtin-missing"
+        serialized = str(definition.get("serialized", "") or "")
+        if not serialized.strip():
+            return "unpublished"
+        expected_hash = str(definition.get("sha256", "") or "").strip()
+        if expected_hash and hashlib.sha256(serialized.encode("utf-8")).hexdigest() != expected_hash:
+            raise ValueError("material payload hash mismatch for {}".format(record.get("id", "")))
+
+        from cura.Settings.ContainerManager import ContainerManager
+        manager = ContainerManager.getInstance()
+        if manager is None:
+            raise RuntimeError("Cura ContainerManager is not available")
+
+        sync_dir = os.path.join(os.path.dirname(self._config_path), "sync-temp")
+        os.makedirs(sync_dir, exist_ok=True)
+        filename = self._normalize_toolhead_text(record.get("id", "material")) + ".xml.fdm_material"
+        temp_path = os.path.join(sync_dir, filename)
+        try:
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                handle.write(serialized)
+            result = manager.importMaterialContainer(temp_path)
+            if not isinstance(result, dict) or result.get("status") != "success":
+                message = result.get("message", "unknown import error") if isinstance(result, dict) else str(result)
+                raise RuntimeError("Cura material import failed: {}".format(message))
+        finally:
+            try:
+                if os.path.isfile(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+
+        if guid and not self._material_guid_exists_locally(guid):
+            raise RuntimeError("material import completed but GUID {} is still not registered".format(guid))
+        return "installed"
+
+    def _find_local_machine_for_record(self, record: Dict[str, Any]) -> Optional[Any]:
+        registry = CuraContainerRegistry.getInstance()
+        record_id = str(record.get("id", "") or "").strip()
+        source_id = str(record.get("cura", {}).get("id", "") or "").strip()
+        candidate_ids = []
+        bound = str(self._machine_bindings.get(record_id, "") or "").strip()
+        if bound:
+            candidate_ids.append(bound)
+        if source_id:
+            candidate_ids.append(source_id)
+        for machine_id in candidate_ids:
+            try:
+                stacks = registry.findContainerStacks(id=machine_id)
+                if stacks:
+                    return stacks[0]
+            except Exception:
+                pass
+        try:
+            metadata = registry.findContainerStacksMetadata(type="machine", eventide_record_id=record_id)
+            for item in metadata:
+                machine_id = str(item.get("id", "") or "").strip()
+                if machine_id:
+                    stacks = registry.findContainerStacks(id=machine_id)
+                    if stacks:
+                        return stacks[0]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _apply_instance_values(container: Any, values: Dict[str, Any]) -> int:
+        changed = 0
+        if container is None or not isinstance(values, dict):
+            return changed
+        for key, value in values.items():
+            try:
+                if container.getProperty(key, "value") != value:
+                    container.setProperty(key, "value", value)
+                    changed += 1
+            except Exception:
+                Logger.logException("w", "Eventide could not restore machine setting %s", key)
+        return changed
+
+    def _install_machine_record(self, record: Dict[str, Any]) -> str:
+        existing = self._find_local_machine_for_record(record)
+        record_id = str(record.get("id", "") or "").strip()
+        if existing is not None:
+            try:
+                self._machine_bindings[record_id] = str(existing.getId() or "")
+                self._save_config()
+            except Exception:
+                pass
+            return "existing"
+
+        definition = record.get("machine_definition", {})
+        if not isinstance(definition, dict) or definition.get("format") != "cura_machine_instance_v1":
+            return "unpublished"
+        definition_id = str(definition.get("definition_id", "") or "").strip()
+        if not definition_id:
+            return "unpublished"
+
+        registry = CuraContainerRegistry.getInstance()
+        if not registry.findDefinitionContainers(id=definition_id):
+            return "missing-definition:{}".format(definition_id)
+
+        machine_manager = self._application.getMachineManager()
+        previous = getattr(machine_manager, "activeMachine", None)
+        previous_id = str(previous.getId() or "") if previous is not None else ""
+        name = str(definition.get("name", "") or record.get("cura", {}).get("name", "") or definition_id)
+
+        try:
+            if not machine_manager.addMachine(definition_id, name):
+                raise RuntimeError("Cura refused to create machine from definition {}".format(definition_id))
+            created = getattr(machine_manager, "activeMachine", None)
+            if created is None:
+                raise RuntimeError("Cura did not expose the newly created machine")
+
+            expected_extruders = list(definition.get("extruders", []) or [])
+            actual_extruders = list(getattr(created, "extruderList", []) or [])
+            if len(expected_extruders) != len(actual_extruders):
+                raise RuntimeError(
+                    "extruder count mismatch: shared {} vs local definition {}".format(
+                        len(expected_extruders), len(actual_extruders)
+                    )
+                )
+
+            self._apply_instance_values(
+                getattr(created, "definitionChanges", None),
+                definition.get("global_definition_changes", {}),
+            )
+            actual_by_position = {}
+            for extruder in actual_extruders:
+                try:
+                    position = int(extruder.getMetaDataEntry("position") or 0)
+                except Exception:
+                    position = len(actual_by_position)
+                actual_by_position[position] = extruder
+            for extruder_data in expected_extruders:
+                position = int(extruder_data.get("position", 0) or 0)
+                target = actual_by_position.get(position)
+                if target is None:
+                    raise RuntimeError("missing target extruder position {}".format(position))
+                source_def = str(extruder_data.get("definition_id", "") or "")
+                target_def = str(getattr(getattr(target, "definition", None), "getId", lambda: "")() or "")
+                if source_def and target_def and source_def != target_def:
+                    raise RuntimeError(
+                        "extruder definition mismatch at position {}: {} vs {}".format(position, source_def, target_def)
+                    )
+                self._apply_instance_values(
+                    getattr(target, "definitionChanges", None),
+                    extruder_data.get("definition_changes", {}),
+                )
+
+            try:
+                created.setMetaDataEntry("eventide_record_id", record_id)
+                created.setMetaDataEntry("eventide_source_machine_id", str(definition.get("source_stack_id", "") or ""))
+            except Exception:
+                pass
+            local_id = str(created.getId() or "")
+            self._machine_bindings[record_id] = local_id
+            self._save_config()
+            try:
+                machine_manager.correctExtruderSettings()
+                machine_manager.correctPrintSequence()
+            except Exception:
+                pass
+            return "installed"
+        finally:
+            if previous_id:
+                try:
+                    machine_manager.setActiveMachine(previous_id)
+                except Exception:
+                    Logger.logException("w", "Eventide could not restore previously active machine")
+
+    @pyqtSlot(str, result=str)
+    def syncLibraryToCura(self, requested_path: str) -> str:
+        """Install missing published materials and machine instances into this Cura profile."""
+        material_stats = {"installed": 0, "existing": 0, "unpublished": 0, "builtin-missing": 0, "failed": 0}
+        machine_stats = {"installed": 0, "existing": 0, "unpublished": 0, "missing-definition": 0, "failed": 0}
+        failures = []
+        try:
+            root = self._save_library_path_from_ui(requested_path)
+            self._require_initialized_library(root)
+
+            filament_dir = os.path.join(root, "filaments")
+            for name in sorted(os.listdir(filament_dir)):
+                if not name.lower().endswith(".json"):
+                    continue
+                try:
+                    record = self._read_json(os.path.join(filament_dir, name))
+                    if record.get("schema") != "eventide.shared_profiles.filament":
+                        continue
+                    outcome = self._install_material_record(record)
+                    material_stats[outcome] = material_stats.get(outcome, 0) + 1
+                except Exception as error:
+                    material_stats["failed"] += 1
+                    failures.append("{}: {}".format(name, error))
+                    Logger.logException("e", "Eventide material sync failed for %s", name)
+
+            printer_dir = os.path.join(root, "printers")
+            for name in sorted(os.listdir(printer_dir)):
+                if not name.lower().endswith(".json"):
+                    continue
+                try:
+                    record = self._read_json(os.path.join(printer_dir, name))
+                    if record.get("schema") != "eventide.shared_profiles.printer":
+                        continue
+                    outcome = self._install_machine_record(record)
+                    if outcome.startswith("missing-definition:"):
+                        machine_stats["missing-definition"] += 1
+                        failures.append("{}: target Cura lacks {}".format(name, outcome.split(":", 1)[1]))
+                    else:
+                        machine_stats[outcome] = machine_stats.get(outcome, 0) + 1
+                except Exception as error:
+                    machine_stats["failed"] += 1
+                    failures.append("{}: {}".format(name, error))
+                    Logger.logException("e", "Eventide machine sync failed for %s", name)
+
+            self._refresh_library_state_internal(require_manifest=True)
+            self.refreshSelection()
+            self._last_sync_summary = (
+                "SYNC COMPLETE: materials {} installed / {} already local / {} not yet published; "
+                "machines {} installed / {} already local / {} not yet published / {} missing base definition; "
+                "{} failure(s)."
+            ).format(
+                material_stats.get("installed", 0), material_stats.get("existing", 0), material_stats.get("unpublished", 0),
+                machine_stats.get("installed", 0), machine_stats.get("existing", 0), machine_stats.get("unpublished", 0),
+                machine_stats.get("missing-definition", 0), len(failures),
+            )
+            if failures:
+                self._last_sync_summary += " First: {}".format(failures[0])
+            self._status = self._last_sync_summary
+        except Exception as error:
+            self._last_sync_summary = "SYNC FAILED: {}".format(error)
+            self._status = self._last_sync_summary
+            Logger.logException("e", "Eventide library-to-Cura sync failed")
+        self.stateChanged.emit()
+        return self._status
+
     @pyqtSlot(str, result=str)
     def validateLibrary(self, requested_path: str) -> str:
         errors = []
@@ -1648,6 +2051,21 @@ class EventideSharedProfiles(QObject, Extension):
                             errors.append("{}: invalid revision".format(name))
                     except Exception:
                         errors.append("{}: invalid revision".format(name))
+
+            for name, record in records_by_folder["filaments"]:
+                definition = record.get("material_definition")
+                if not isinstance(definition, dict):
+                    warnings.append("{}: material definition not published; other PCs cannot install it yet".format(name))
+                elif definition.get("serialized"):
+                    serialized = str(definition.get("serialized") or "")
+                    expected_hash = str(definition.get("sha256", "") or "")
+                    if expected_hash and hashlib.sha256(serialized.encode("utf-8")).hexdigest() != expected_hash:
+                        errors.append("{}: material payload hash mismatch".format(name))
+
+            for name, record in records_by_folder["printers"]:
+                definition = record.get("machine_definition")
+                if not isinstance(definition, dict):
+                    warnings.append("{}: machine definition changes not published; other PCs cannot recreate it yet".format(name))
 
             for name, record in records_by_folder["capabilities"]:
                 if record.get("printer_id") not in ids_by_folder["printers"]:
@@ -1705,6 +2123,7 @@ class EventideSharedProfiles(QObject, Extension):
                 "last_guardrail={}".format(self._last_gcode_guardrail_summary),
                 "last_library_event={}".format(self._last_library_event),
                 "library_validation={}".format(self._library_validation_summary),
+                "last_sync={}".format(self._last_sync_summary),
                 "inventory=printers:{},filaments:{},capabilities:{},quality:{}".format(
                     self._printer_count, self._filament_count, self._capability_count, self._quality_count
                 ),
@@ -1883,6 +2302,17 @@ class EventideSharedProfiles(QObject, Extension):
                 self._active_material_name,
             )
 
+            # Publish portable sync payloads. Built-in materials are recorded as
+            # built-in identities without duplicating Cura's read-only XML. Machine
+            # snapshots intentionally capture definitionChanges only, never current
+            # quality/user slicing overrides.
+            material_payload_changed = self._update_record_section(
+                filament_path, "material_definition", self._capture_active_material_definition()
+            )
+            machine_payload_changed = self._update_record_section(
+                printer_path, "machine_definition", self._capture_active_machine_definition()
+            )
+
             candidates = self._capability_candidates(
                 root, preferred_nozzle_material=(self._active_nozzle_material or None)
             )
@@ -1960,9 +2390,9 @@ class EventideSharedProfiles(QObject, Extension):
                 self._active_nozzle_material = registered_material
 
             changed_parts = []
-            if printer_changed:
+            if printer_changed or machine_payload_changed:
                 changed_parts.append("printer")
-            if filament_changed:
+            if filament_changed or material_payload_changed:
                 changed_parts.append("filament")
             if capability_changed:
                 changed_parts.append("capability")
@@ -2657,3 +3087,7 @@ class EventideSharedProfiles(QObject, Extension):
     @pyqtProperty(str, notify=stateChanged)
     def libraryValidationSummary(self) -> str:
         return self._library_validation_summary
+
+    @pyqtProperty(str, notify=stateChanged)
+    def lastSyncSummary(self) -> str:
+        return self._last_sync_summary

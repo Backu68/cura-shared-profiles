@@ -72,3 +72,13 @@ These tests do not require a functioning printer unless explicitly noted.
 ## Bug reports
 
 Use **Diagnostics → Export Diagnostics** and attach the report with the Cura log and, when relevant, the generated G-code. Review the diagnostics text before sharing because it contains host/selection IDs and the shared-library path.
+
+
+## Cross-PC material and machine sync (0.7.1)
+1. On PC A, select a custom material and printer and click **Register Current Selection**.
+2. Validate the library; the material/printer records should no longer warn that their portable definitions are unpublished.
+3. On PC B, where the custom material is absent, click **Sync Library to Cura**.
+4. Confirm the material appears in Cura and its GUID matches the shared material record.
+5. If the printer is absent but its base definition exists on PC B, confirm Eventide recreates the machine and restores its machine definition changes.
+6. Run Sync again; it must report the material/machine as already local and must not create duplicates.
+7. If a printer record references a base definition PC B does not have, sync must report `missing base definition` and must not guess or install a substitute.
