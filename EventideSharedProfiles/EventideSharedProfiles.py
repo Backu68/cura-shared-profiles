@@ -8,15 +8,18 @@ import math
 import platform
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import Any, Dict, Optional, Tuple, cast, List
 
 from PyQt6.QtCore import QObject, QTimer, pyqtProperty, pyqtSignal, pyqtSlot
+from PyQt6.QtWidgets import QFileDialog
 
 from UM.Extension import Extension
 from UM.Logger import Logger
+from UM.Settings.InstanceContainer import InstanceContainer
 from cura.CuraApplication import CuraApplication
 from cura.CuraVersion import CuraVersion
 from cura.Settings.CuraContainerRegistry import CuraContainerRegistry
+from cura.Machines.ContainerTree import ContainerTree
 
 
 class EventideSharedProfiles(QObject, Extension):
@@ -25,10 +28,10 @@ class EventideSharedProfiles(QObject, Extension):
     stateChanged = pyqtSignal()
 
     CONFIG_FILENAME = "eventide_shared_profiles.json"
-    PLUGIN_VERSION = "0.7.1"
+    PLUGIN_VERSION = "0.8.0"
     LIBRARY_FORMAT = 1
     RECORD_FORMAT = 1
-    LIBRARY_POLL_INTERVAL_MS = 3000
+    LIBRARY_POLL_INTERVAL_MS = 2500
 
     def __init__(self) -> None:
         QObject.__init__(self, None)
@@ -83,11 +86,15 @@ class EventideSharedProfiles(QObject, Extension):
         self._last_slice_resolution = "Slice-time hook not checked yet."
         self._last_gcode_guardrail_summary = "No Eventide G-code guardrail run yet."
         self._toolhead_bindings: Dict[str, str] = {}
-        self._library_manifest_signature: Optional[Tuple[int, int]] = None
-        self._last_library_event = "Library watcher not started yet."
+        self._library_manifest_signature: Optional[Tuple[int, int]] = None  # legacy field; v0.8 fingerprints all record dirs
+        self._library_content_signature: Optional[str] = None
+        self._last_library_event = "Live sync waiting for a shared library."
         self._library_validation_summary = "Library not validated yet."
-        self._last_sync_summary = "Library has not been synchronized to this Cura install yet."
+        self._last_sync_summary = "Not synchronized yet."
+        self._last_quality_sync_summary = "No shared quality-profile activity yet."
         self._machine_bindings: Dict[str, str] = {}
+        self._quality_sync_state: Dict[str, Dict[str, Any]] = {}
+        self._live_sync_busy = False
 
         self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self._legacy_config_path = os.path.join(self._plugin_dir, self.CONFIG_FILENAME)
@@ -163,6 +170,13 @@ class EventideSharedProfiles(QObject, Extension):
                     for key, value in raw_machine_bindings.items()
                     if str(key).strip() and str(value).strip()
                 }
+            raw_quality_state = data.get("quality_sync_state", {})
+            if isinstance(raw_quality_state, dict):
+                self._quality_sync_state = {
+                    str(key): dict(value)
+                    for key, value in raw_quality_state.items()
+                    if str(key).strip() and isinstance(value, dict)
+                }
 
             if source_path == self._legacy_config_path:
                 self._save_config()
@@ -176,11 +190,12 @@ class EventideSharedProfiles(QObject, Extension):
         self._atomic_write_json(
             self._config_path,
             {
-                "format": 4,
+                "format": 5,
                 "shared_library_path": self._shared_library_path,
                 "client_id": self._client_id,
                 "toolhead_bindings": self._toolhead_bindings,
                 "machine_bindings": self._machine_bindings,
+                "quality_sync_state": self._quality_sync_state,
             },
         )
 
@@ -1701,6 +1716,7 @@ class EventideSharedProfiles(QObject, Extension):
         self._runtime_hooks_connected = True
 
     def _get_manifest_signature(self) -> Optional[Tuple[int, int]]:
+        """Legacy helper retained for diagnostics/backward compatibility."""
         if not self._shared_library_path:
             return None
         path = self._manifest_path(os.path.normpath(self._shared_library_path))
@@ -1710,20 +1726,72 @@ class EventideSharedProfiles(QObject, Extension):
         except OSError:
             return None
 
+    def _get_library_content_signature(self) -> Optional[str]:
+        """Fingerprint all shared records so SMB changes are noticed without native FS events."""
+        if not self._shared_library_path:
+            return None
+        root = os.path.normpath(self._shared_library_path)
+        if not os.path.isdir(root):
+            return None
+        digest = hashlib.sha256()
+        paths: List[str] = [self._manifest_path(root)]
+        for folder in ("printers", "filaments", "capabilities", "quality"):
+            folder_path = os.path.join(root, folder)
+            try:
+                names = sorted(name for name in os.listdir(folder_path) if name.lower().endswith(".json"))
+            except OSError:
+                names = []
+            paths.extend(os.path.join(folder_path, name) for name in names)
+        for path in paths:
+            rel = os.path.relpath(path, root).replace("\\", "/")
+            digest.update(rel.encode("utf-8", errors="replace"))
+            try:
+                stat = os.stat(path)
+                digest.update(str(int(stat.st_mtime_ns)).encode("ascii"))
+                digest.update(str(int(stat.st_size)).encode("ascii"))
+            except OSError:
+                digest.update(b"missing")
+        return digest.hexdigest()
+
     def _poll_shared_library(self) -> None:
-        signature = self._get_manifest_signature()
-        if signature == self._library_manifest_signature:
+        if self._live_sync_busy or not self._shared_library_path:
             return
-        self._library_manifest_signature = signature
+        root = os.path.normpath(self._shared_library_path)
+        if not os.path.isfile(self._manifest_path(root)):
+            return
+
+        self._live_sync_busy = True
+        changed_ui = False
         try:
-            self._refresh_library_state_internal(require_manifest=False)
-            self._last_library_event = "Shared library changed on disk; inventory refreshed at {}.".format(
-                self._utc_now()
-            )
-            self.stateChanged.emit()
+            # Local Cura custom profiles are the only objects that are published
+            # automatically. Machine/material publication remains an explicit
+            # "Share Current Setup" action because those are structural objects.
+            quality_publish = self._publish_local_quality_profiles(root)
+            if quality_publish.get("changed", 0) or quality_publish.get("conflicts", 0):
+                changed_ui = True
+
+            signature = self._get_library_content_signature()
+            remote_changed = signature != self._library_content_signature
+            if remote_changed:
+                # The regular sync path safely installs missing machines/materials
+                # and also updates shared quality profiles. It is safe to call from
+                # the timer because _live_sync_busy prevents recursion.
+                self.syncLibraryToCura(self._shared_library_path)
+                self._refresh_library_state_internal(require_manifest=False)
+                self._library_content_signature = self._get_library_content_signature()
+                self._last_library_event = "Live sync applied shared-library changes at {}.".format(self._utc_now())
+                changed_ui = True
+            elif quality_publish.get("changed", 0):
+                self._library_content_signature = self._get_library_content_signature()
+                self._last_library_event = "Live sync published local quality changes at {}.".format(self._utc_now())
+                changed_ui = True
         except Exception as error:
-            self._last_library_event = "Library watcher error: {}".format(error)
-            Logger.logException("e", "Eventide shared library polling failed")
+            self._last_library_event = "Live sync error: {}".format(error)
+            Logger.logException("e", "Eventide live shared-library polling failed")
+            changed_ui = True
+        finally:
+            self._live_sync_busy = False
+        if changed_ui:
             self.stateChanged.emit()
 
     @pyqtSlot(str, result=str)
@@ -1938,11 +2006,385 @@ class EventideSharedProfiles(QObject, Extension):
                 except Exception:
                     Logger.logException("w", "Eventide could not restore previously active machine")
 
+    @staticmethod
+    def _quality_hash(payload: Dict[str, Any]) -> str:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _current_printer_record_id(self) -> str:
+        if not self._active_printer_id:
+            raise ValueError("Cura does not have an active printer id")
+        return self._stable_id("printer", self._active_printer_id)
+
+    def _quality_group_payload(self, printer_record_id: str, group: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
+        registry = CuraContainerRegistry.getInstance()
+        global_meta = dict(getattr(group, "metadata_for_global", {}) or {})
+        extruder_meta = dict(getattr(group, "metadata_per_extruder", {}) or {})
+        if not global_meta:
+            return None
+        global_id = str(global_meta.get("id", "") or "").strip()
+        containers = registry.findInstanceContainers(id=global_id) if global_id else []
+        if not containers:
+            return None
+        global_container = containers[0]
+        quality_id = str(global_container.getMetaDataEntry("eventide_record_id", "") or "").strip()
+        if not quality_id:
+            quality_id = self._stable_id("quality", printer_record_id, global_id or str(group.name))
+
+        # Stamp a stable Eventide identity onto every member of the local group.
+        # This lets a profile round-trip to another PC, be edited there, and
+        # publish back to the same shared record rather than creating a duplicate.
+        member_containers: List[Any] = [global_container]
+        extruders_payload = []
+        for position in sorted(extruder_meta, key=lambda value: int(value)):
+            metadata = extruder_meta[position]
+            container_id = str(metadata.get("id", "") or "").strip()
+            matches = registry.findInstanceContainers(id=container_id) if container_id else []
+            if not matches:
+                continue
+            container = matches[0]
+            member_containers.append(container)
+            extruders_payload.append({
+                "position": int(position),
+                "values": self._instance_values(container),
+            })
+
+        for container in member_containers:
+            try:
+                if str(container.getMetaDataEntry("eventide_record_id", "") or "") != quality_id:
+                    container.setMetaDataEntry("eventide_record_id", quality_id)
+                if str(container.getMetaDataEntry("eventide_printer_id", "") or "") != printer_record_id:
+                    container.setMetaDataEntry("eventide_printer_id", printer_record_id)
+            except Exception:
+                Logger.logException("w", "Eventide could not stamp quality profile identity")
+
+        quality_definition = str(global_meta.get("definition", "") or global_container.getMetaDataEntry("definition", "") or "").strip()
+        payload = {
+            "printer_id": printer_record_id,
+            "name": str(getattr(group, "name", "") or global_container.getName() or "Shared Profile"),
+            "quality_type": str(getattr(group, "quality_type", "") or global_container.getMetaDataEntry("quality_type", "not_supported") or "not_supported"),
+            "intent_category": str(getattr(group, "intent_category", "default") or "default"),
+            "quality_definition": quality_definition,
+            "global_values": self._instance_values(global_container),
+            "extruders": extruders_payload,
+        }
+        payload["content_hash"] = self._quality_hash(payload)
+        return quality_id, payload
+
+    def _publish_local_quality_profiles(self, root: str) -> Dict[str, int]:
+        stats = {"changed": 0, "current": 0, "conflicts": 0, "skipped": 0, "failed": 0}
+        try:
+            if not self._active_printer_id or self._application.getGlobalContainerStack() is None:
+                return stats
+            printer_record_id = self._current_printer_record_id()
+            printer_path = os.path.join(root, "printers", printer_record_id + ".json")
+            if not os.path.isfile(printer_path):
+                stats["skipped"] += 1
+                self._last_quality_sync_summary = "Quality sync waiting: share the current printer first."
+                return stats
+
+            groups = ContainerTree.getInstance().getCurrentQualityChangesGroups()
+            touched = False
+            state_changed = False
+            for group in groups:
+                try:
+                    captured = self._quality_group_payload(printer_record_id, group)
+                    if captured is None:
+                        stats["skipped"] += 1
+                        continue
+                    quality_id, payload = captured
+                    path = os.path.join(root, "quality", quality_id + ".json")
+                    local_hash = str(payload["content_hash"])
+                    state = dict(self._quality_sync_state.get(quality_id, {}) or {})
+
+                    if os.path.isfile(path):
+                        record = self._read_json(path)
+                        if record.get("schema") != "eventide.shared_profiles.quality" or record.get("id") != quality_id:
+                            raise ValueError("quality record identity mismatch")
+                        remote_hash = str(record.get("content_hash", "") or "")
+                        remote_revision = int(record.get("revision", 0) or 0)
+                        if remote_hash == local_hash:
+                            stats["current"] += 1
+                            self._quality_sync_state[quality_id] = {
+                                "revision": remote_revision,
+                                "content_hash": local_hash,
+                                "printer_id": printer_record_id,
+                            }
+                            state_changed = True
+                            continue
+
+                        seen_revision = int(state.get("revision", 0) or 0)
+                        seen_hash = str(state.get("content_hash", "") or "")
+                        remote_writer = str(record.get("updated_by", {}).get("client_id", "") or "")
+                        # Remote moved after our last synchronized revision. If
+                        # local stayed unchanged, receive the remote version on
+                        # this poll instead of writing stale data back. If both
+                        # moved, flag a real conflict.
+                        if remote_writer != self._client_id:
+                            if seen_revision and remote_revision != seen_revision:
+                                if local_hash == seen_hash:
+                                    stats["skipped"] += 1
+                                    continue
+                                stats["conflicts"] += 1
+                                continue
+                            if not seen_revision and remote_writer:
+                                stats["conflicts"] += 1
+                                continue
+                        revision = remote_revision + 1
+                        created_utc = record.get("created_utc", self._utc_now())
+                    else:
+                        revision = 1
+                        created_utc = self._utc_now()
+
+                    now = self._utc_now()
+                    record = {
+                        "schema": "eventide.shared_profiles.quality",
+                        "format": self.RECORD_FORMAT,
+                        "id": quality_id,
+                        "revision": revision,
+                        "created_utc": created_utc,
+                        "updated_utc": now,
+                        "updated_by": self._writer_info(),
+                        **payload,
+                    }
+                    self._atomic_write_json(path, record)
+                    self._quality_sync_state[quality_id] = {
+                        "revision": revision,
+                        "content_hash": local_hash,
+                        "printer_id": printer_record_id,
+                    }
+                    touched = True
+                    state_changed = True
+                    stats["changed"] += 1
+                except Exception:
+                    stats["failed"] += 1
+                    Logger.logException("e", "Eventide could not publish a local quality profile")
+
+            if touched:
+                self._touch_manifest(root)
+            if state_changed:
+                self._save_config()
+            if stats["conflicts"]:
+                self._last_quality_sync_summary = "QUALITY CONFLICT: {} profile(s) changed both locally and in the shared library.".format(stats["conflicts"])
+            elif stats["changed"]:
+                self._last_quality_sync_summary = "Live quality sync published {} profile change(s).".format(stats["changed"])
+            elif groups:
+                self._last_quality_sync_summary = "Live quality sync: {} local custom profile(s) current.".format(len(groups))
+        except Exception as error:
+            stats["failed"] += 1
+            self._last_quality_sync_summary = "Quality publish error: {}".format(error)
+            Logger.logException("e", "Eventide quality-profile publication failed")
+        return stats
+
+    def _quality_local_containers(self, quality_id: str) -> Tuple[Optional[Any], Dict[int, Any]]:
+        registry = CuraContainerRegistry.getInstance()
+        global_container = None
+        extruders: Dict[int, Any] = {}
+        try:
+            metadata_list = registry.findInstanceContainersMetadata(type="quality_changes", eventide_record_id=quality_id)
+        except Exception:
+            metadata_list = []
+        for metadata in metadata_list:
+            container_id = str(metadata.get("id", "") or "").strip()
+            matches = registry.findInstanceContainers(id=container_id) if container_id else []
+            if not matches:
+                continue
+            position = metadata.get("position")
+            if position is None or str(position) == "None":
+                global_container = matches[0]
+            else:
+                try:
+                    extruders[int(position)] = matches[0]
+                except Exception:
+                    continue
+        return global_container, extruders
+
+    def _quality_payload_from_local_containers(self, printer_id: str, global_container: Any, extruders: Dict[int, Any]) -> Dict[str, Any]:
+        payload = {
+            "printer_id": printer_id,
+            "name": str(global_container.getName() or "Shared Profile"),
+            "quality_type": str(global_container.getMetaDataEntry("quality_type", "not_supported") or "not_supported"),
+            "intent_category": str(global_container.getMetaDataEntry("intent_category", "default") or "default"),
+            "quality_definition": str(global_container.getMetaDataEntry("definition", "") or ""),
+            "global_values": self._instance_values(global_container),
+            "extruders": [
+                {"position": int(position), "values": self._instance_values(extruders[position])}
+                for position in sorted(extruders)
+            ],
+        }
+        payload["content_hash"] = self._quality_hash(payload)
+        return payload
+
+    def _create_quality_container(self, base_id: str, record: Dict[str, Any], quality_definition: str, position: Optional[int], values: Dict[str, Any]) -> Any:
+        registry = CuraContainerRegistry.getInstance()
+        name = str(record.get("name", "") or "Shared Profile")
+        seed = "{}_{}".format(base_id, name).lower().replace(" ", "_")
+        container_id = registry.uniqueName(seed)
+        container = InstanceContainer(container_id)
+        container.setName(name)
+        container.setMetaDataEntry("type", "quality_changes")
+        container.setMetaDataEntry("quality_type", str(record.get("quality_type", "not_supported") or "not_supported"))
+        intent = str(record.get("intent_category", "default") or "default")
+        if intent != "default":
+            container.setMetaDataEntry("intent_category", intent)
+        if position is not None:
+            container.setMetaDataEntry("position", int(position))
+        container.setMetaDataEntry("eventide_record_id", str(record.get("id", "") or ""))
+        container.setMetaDataEntry("eventide_printer_id", str(record.get("printer_id", "") or ""))
+        container.setDefinition(quality_definition)
+        container.setMetaDataEntry("setting_version", self._application.SettingVersion)
+        self._apply_instance_values(container, values)
+        registry.addContainer(container)
+        return container
+
+    def _apply_quality_record(self, root: str, record: Dict[str, Any]) -> str:
+        quality_id = str(record.get("id", "") or "").strip()
+        printer_id = str(record.get("printer_id", "") or "").strip()
+        if not quality_id or not printer_id:
+            raise ValueError("quality record missing id or printer_id")
+        printer_path = os.path.join(root, "printers", printer_id + ".json")
+        if not os.path.isfile(printer_path):
+            return "missing-printer-record"
+        printer_record = self._read_json(printer_path)
+        target_machine = self._find_local_machine_for_record(printer_record)
+        if target_machine is None:
+            return "missing-machine"
+
+        machine_definition_id = str(target_machine.definition.getId() or "")
+        try:
+            quality_definition = str(ContainerTree.getInstance().machines[machine_definition_id].quality_definition or "")
+        except Exception:
+            quality_definition = str(record.get("quality_definition", "") or "fdmprinter")
+        registry = CuraContainerRegistry.getInstance()
+        if not registry.findDefinitionContainers(id=quality_definition):
+            return "missing-quality-definition"
+
+        global_container, extruder_containers = self._quality_local_containers(quality_id)
+        if global_container is None:
+            try:
+                same_name = registry.findInstanceContainersMetadata(
+                    type="quality_changes", definition=quality_definition, name=str(record.get("name", "") or "Shared Profile")
+                )
+            except Exception:
+                same_name = []
+            for metadata in same_name:
+                existing_eventide_id = str(metadata.get("eventide_record_id", "") or "").strip()
+                if existing_eventide_id != quality_id:
+                    return "name-conflict"
+        remote_hash = str(record.get("content_hash", "") or "")
+        remote_revision = int(record.get("revision", 0) or 0)
+        state = dict(self._quality_sync_state.get(quality_id, {}) or {})
+
+        if global_container is not None:
+            local_payload = self._quality_payload_from_local_containers(printer_id, global_container, extruder_containers)
+            local_hash = str(local_payload.get("content_hash", "") or "")
+            if local_hash == remote_hash:
+                self._quality_sync_state[quality_id] = {"revision": remote_revision, "content_hash": remote_hash, "printer_id": printer_id}
+                self._save_config()
+                return "existing"
+            seen_hash = str(state.get("content_hash", "") or "")
+            seen_revision = int(state.get("revision", 0) or 0)
+            if not seen_revision:
+                return "conflict"
+            if local_hash != seen_hash:
+                if remote_revision != seen_revision:
+                    return "conflict"
+                # Local moved while shared did not. Never overwrite it from a
+                # manual/automatic receive pass; the publisher will send it.
+                return "local-newer"
+
+        name = str(record.get("name", "") or "Shared Profile")
+        quality_type = str(record.get("quality_type", "not_supported") or "not_supported")
+        intent = str(record.get("intent_category", "default") or "default")
+        global_values = dict(record.get("global_values", {}) or {})
+        remote_extruders = {int(item.get("position", 0)): dict(item.get("values", {}) or {}) for item in list(record.get("extruders", []) or []) if isinstance(item, dict)}
+
+        if global_container is None:
+            global_container = self._create_quality_container(machine_definition_id, record, quality_definition, None, global_values)
+            created = True
+        else:
+            created = False
+            global_container.setName(name, supress_signals=True)
+            global_container.clear()
+            global_container.setDefinition(quality_definition)
+            global_container.setMetaDataEntry("quality_type", quality_type)
+            if intent != "default":
+                global_container.setMetaDataEntry("intent_category", intent)
+            global_container.setMetaDataEntry("eventide_record_id", quality_id)
+            global_container.setMetaDataEntry("eventide_printer_id", printer_id)
+            self._apply_instance_values(global_container, global_values)
+
+        target_extruders = {}
+        for extruder in list(getattr(target_machine, "extruderList", []) or []):
+            try:
+                target_extruders[int(extruder.getMetaDataEntry("position") or 0)] = extruder
+            except Exception:
+                continue
+        for position, values in remote_extruders.items():
+            if position not in target_extruders:
+                continue
+            container = extruder_containers.get(position)
+            if container is None:
+                container = self._create_quality_container(target_extruders[position].getId(), record, quality_definition, position, values)
+            else:
+                container.setName(name, supress_signals=True)
+                container.clear()
+                container.setDefinition(quality_definition)
+                container.setMetaDataEntry("quality_type", quality_type)
+                if intent != "default":
+                    container.setMetaDataEntry("intent_category", intent)
+                container.setMetaDataEntry("position", position)
+                container.setMetaDataEntry("eventide_record_id", quality_id)
+                container.setMetaDataEntry("eventide_printer_id", printer_id)
+                self._apply_instance_values(container, values)
+
+        self._quality_sync_state[quality_id] = {"revision": remote_revision, "content_hash": remote_hash, "printer_id": printer_id}
+        self._save_config()
+        try:
+            manager = self._application.getMachineManager()
+            manager.activeQualityChanged.emit()
+            manager.activeQualityGroupChanged.emit()
+        except Exception:
+            pass
+        return "installed" if created else "updated"
+
+    def _sync_quality_records(self, root: str) -> Tuple[Dict[str, int], List[str]]:
+        stats = {"installed": 0, "updated": 0, "existing": 0, "local-newer": 0, "conflict": 0, "name-conflict": 0, "missing-machine": 0, "missing-printer-record": 0, "missing-quality-definition": 0, "failed": 0}
+        failures: List[str] = []
+        quality_dir = os.path.join(root, "quality")
+        try:
+            names = sorted(name for name in os.listdir(quality_dir) if name.lower().endswith(".json"))
+        except OSError:
+            names = []
+        for name in names:
+            try:
+                record = self._read_json(os.path.join(quality_dir, name))
+                if record.get("schema") != "eventide.shared_profiles.quality":
+                    continue
+                outcome = self._apply_quality_record(root, record)
+                stats[outcome] = stats.get(outcome, 0) + 1
+                if outcome == "conflict":
+                    failures.append("{}: local and shared profile both changed".format(name))
+                elif outcome == "name-conflict":
+                    failures.append("{}: Cura already has a different custom profile with this name".format(name))
+            except Exception as error:
+                stats["failed"] += 1
+                failures.append("{}: {}".format(name, error))
+                Logger.logException("e", "Eventide quality sync failed for %s", name)
+        if stats["conflict"] or stats["name-conflict"]:
+            self._last_quality_sync_summary = "QUALITY CONFLICT: {} edit conflict(s), {} name conflict(s).".format(stats["conflict"], stats["name-conflict"])
+        elif stats["installed"] or stats["updated"]:
+            self._last_quality_sync_summary = "Live quality sync: {} installed, {} updated.".format(stats["installed"], stats["updated"])
+        elif sum(stats.values()):
+            self._last_quality_sync_summary = "Live quality sync: shared profiles are current."
+        return stats, failures
+
     @pyqtSlot(str, result=str)
     def syncLibraryToCura(self, requested_path: str) -> str:
         """Install missing published materials and machine instances into this Cura profile."""
         material_stats = {"installed": 0, "existing": 0, "unpublished": 0, "builtin-missing": 0, "failed": 0}
         machine_stats = {"installed": 0, "existing": 0, "unpublished": 0, "missing-definition": 0, "failed": 0}
+        quality_stats = {"installed": 0, "updated": 0, "existing": 0, "local-newer": 0, "conflict": 0, "name-conflict": 0, "failed": 0}
         failures = []
         try:
             root = self._save_library_path_from_ui(requested_path)
@@ -1982,16 +2424,19 @@ class EventideSharedProfiles(QObject, Extension):
                     failures.append("{}: {}".format(name, error))
                     Logger.logException("e", "Eventide machine sync failed for %s", name)
 
+            quality_stats, quality_failures = self._sync_quality_records(root)
+            failures.extend(quality_failures)
+
             self._refresh_library_state_internal(require_manifest=True)
             self.refreshSelection()
             self._last_sync_summary = (
-                "SYNC COMPLETE: materials {} installed / {} already local / {} not yet published; "
-                "machines {} installed / {} already local / {} not yet published / {} missing base definition; "
-                "{} failure(s)."
+                "SYNC: materials +{} / {} local; machines +{} / {} local; "
+                "quality +{} / {} updated / {} local; {} conflict(s); {} failure(s)."
             ).format(
-                material_stats.get("installed", 0), material_stats.get("existing", 0), material_stats.get("unpublished", 0),
-                machine_stats.get("installed", 0), machine_stats.get("existing", 0), machine_stats.get("unpublished", 0),
-                machine_stats.get("missing-definition", 0), len(failures),
+                material_stats.get("installed", 0), material_stats.get("existing", 0),
+                machine_stats.get("installed", 0), machine_stats.get("existing", 0),
+                quality_stats.get("installed", 0), quality_stats.get("updated", 0), quality_stats.get("existing", 0),
+                quality_stats.get("conflict", 0) + quality_stats.get("name-conflict", 0), len(failures),
             )
             if failures:
                 self._last_sync_summary += " First: {}".format(failures[0])
@@ -2017,6 +2462,7 @@ class EventideSharedProfiles(QObject, Extension):
                 "printers": "eventide.shared_profiles.printer",
                 "filaments": "eventide.shared_profiles.filament",
                 "capabilities": "eventide.shared_profiles.capability",
+                "quality": "eventide.shared_profiles.quality",
             }
             ids_by_folder: Dict[str, set] = {name: set() for name in expected}
             records_by_folder: Dict[str, list] = {name: [] for name in expected}
@@ -2066,6 +2512,24 @@ class EventideSharedProfiles(QObject, Extension):
                 definition = record.get("machine_definition")
                 if not isinstance(definition, dict):
                     warnings.append("{}: machine definition changes not published; other PCs cannot recreate it yet".format(name))
+
+            for name, record in records_by_folder["quality"]:
+                if record.get("printer_id") not in ids_by_folder["printers"]:
+                    errors.append("{}: missing printer reference".format(name))
+                if not str(record.get("name", "") or "").strip():
+                    errors.append("{}: quality profile name is blank".format(name))
+                content_hash = str(record.get("content_hash", "") or "")
+                payload = {
+                    "printer_id": record.get("printer_id"),
+                    "name": record.get("name"),
+                    "quality_type": record.get("quality_type"),
+                    "intent_category": record.get("intent_category", "default"),
+                    "quality_definition": record.get("quality_definition", ""),
+                    "global_values": record.get("global_values", {}),
+                    "extruders": record.get("extruders", []),
+                }
+                if content_hash and self._quality_hash(payload) != content_hash:
+                    errors.append("{}: quality content hash mismatch".format(name))
 
             for name, record in records_by_folder["capabilities"]:
                 if record.get("printer_id") not in ids_by_folder["printers"]:
@@ -2160,6 +2624,38 @@ class EventideSharedProfiles(QObject, Extension):
     @pyqtSlot(result=str)
     def ping(self) -> str:
         return "Python hook OK — Eventide Shared Profiles v{}".format(self.PLUGIN_VERSION)
+
+    @pyqtSlot(result=str)
+    def browseForLibraryPath(self) -> str:
+        """Open the native folder picker; native Windows dialog supports UNC/network browsing."""
+        try:
+            start = self._shared_library_path or os.path.expanduser("~")
+            selected = QFileDialog.getExistingDirectory(None, "Select Eventide Shared Library", start, QFileDialog.Option.ShowDirsOnly)
+            return str(selected or "")
+        except Exception as error:
+            Logger.logException("e", "Eventide library folder browser failed")
+            self._status = "BROWSE FAILED: {}".format(error)
+            self.stateChanged.emit()
+            return ""
+
+    @pyqtSlot(str, result=str)
+    def connectLibrary(self, requested_path: str) -> str:
+        """Normal first-run action: save an existing library, refresh, and synchronize it."""
+        try:
+            root = self._save_library_path_from_ui(requested_path)
+            self._require_initialized_library(root)
+            self._refresh_library_state_internal(require_manifest=True)
+            self._library_content_signature = None  # Force an immediate full live-sync pass.
+            result = self.syncLibraryToCura(requested_path)
+            if result.startswith("SYNC FAILED"):
+                return result
+            self._library_content_signature = self._get_library_content_signature()
+            self._status = "CONNECTED: live sync is active."
+        except Exception as error:
+            self._status = "CONNECT FAILED: {}".format(error)
+            Logger.logException("e", "Eventide could not connect shared library")
+        self.stateChanged.emit()
+        return self._status
 
     @pyqtSlot(str, result=str)
     def saveSharedLibraryPath(self, requested_path: str) -> str:
@@ -2380,6 +2876,7 @@ class EventideSharedProfiles(QObject, Extension):
                     capability_changed = True
 
             self._touch_manifest(root)
+            self._publish_local_quality_profiles(root)
             self._refresh_library_state_internal(require_manifest=True)
             self._set_capability_editor_from_record(record)
             registered_material = str(record.get("hotend", {}).get("nozzle_material", "") or "").strip()
@@ -3091,3 +3588,7 @@ class EventideSharedProfiles(QObject, Extension):
     @pyqtProperty(str, notify=stateChanged)
     def lastSyncSummary(self) -> str:
         return self._last_sync_summary
+
+    @pyqtProperty(str, notify=stateChanged)
+    def lastQualitySyncSummary(self) -> str:
+        return self._last_quality_sync_summary

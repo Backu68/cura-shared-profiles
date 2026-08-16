@@ -1,58 +1,55 @@
-# Eventide Shared Profiles 0.7.1 Beta
+# Eventide Shared Profiles 0.8.0 Beta
 
-Eventide Shared Profiles is an early beta plugin for UltiMaker Cura 5.13.0.
+Eventide Shared Profiles is an early beta plugin for UltiMaker Cura 5.13.x that keeps selected Cura configuration objects in a shared filesystem library (including SMB/NAS paths) while leaving Cura itself local and responsive.
 
-## Beta scope
+## Current beta scope
 
-Currently working:
+Working now:
 
-- shared printer/material identity records
 - portable custom-material publish/import with preserved Cura GUID
 - machine-instance publish/recreation when the target Cura has the same base definition
+- **two-way shared custom quality-profile synchronization**
+  - global + per-extruder `quality_changes` groups
+  - Eventide-scoped to the shared printer record
+  - stable cross-PC Eventide identity
+  - revision/content-hash conflict protection
+- **live shared-library polling** (SMB-friendly; no native filesystem watcher required)
+- automatic synchronization when shared records change
 - printer + material + extruder + nozzle capability records
 - transient slice-time capability injection without persistent Cura `userChanges`
 - max linear-speed and max volumetric-flow enforcement
-- temperature offset
-- retraction distance/speed override
-- material-flow multiplier
+- temperature offset, retraction override, material-flow multiplier
 - optional Klipper `SET_PRESSURE_ADVANCE`
-- final G-code hard-limit guardrail for single-extruder slices
-- persistent local nozzle-material binding (for example Brass vs Hardened Steel)
-- optimistic revision conflict protection
-- atomic JSON writes
-- shared-library polling/inventory refresh
-- library validation
-- local diagnostics export
+- single-extruder final G-code hard-limit guardrail
+- optimistic record revision conflict protection and atomic JSON writes
+- native folder **Browse…** button for the shared library path
+- library validation and diagnostics export under Advanced
 
-Not finished yet:
+## Normal workflow
 
-- syncing third-party custom machine definition files that are not already installed on the target Cura
-- automatic background installation (v0.7.1 uses an explicit **Sync Library to Cura** action)
-- shared quality-profile capture/application
-- edit lock/lease UI (revision conflicts already prevent stale overwrites)
-- final G-code hard-limit/PA stamping for multi-extruder slices
-
-## Safety behavior
-
-If Eventide cannot uniquely resolve a capability or a capability is malformed, it fails open to Cura's untouched copied settings rather than guessing. Multi-extruder slices currently skip the final Eventide G-code guardrail/PA stamping rather than applying the wrong tool's capability.
-
-## Tester workflow
-
-1. Install into Cura's plugin directory and restart Cura.
+1. Install the plugin and restart Cura.
 2. Open **Extensions → Eventide Shared Profiles**.
-3. Set a shared library path and initialize it.
-4. Register the current printer/material selection.
-5. Bind the active nozzle material if applicable.
-6. Edit/save the capability.
-7. Slice normally; opening Eventide is not required for capability activation after startup.
-8. Use **Diagnostics → Validate Library** and **Export Diagnostics** when filing bugs.
+3. **Browse…** to the shared library and click **Connect**.
+4. On a source Cura install, choose the printer/material and click **Share current setup**.
+5. Custom Cura quality profiles for that shared printer are then published and updated automatically while Cura is running.
+6. Other connected Cura installs automatically detect shared changes and install/update shared quality profiles when safe.
 
-Review exported diagnostics before sharing; it includes local host, selection IDs, and the shared-library path.
+## Quality-profile safety
 
-## Wider beta testing
+Cura represents one visible custom profile as a group containing a global `quality_changes` container and one container per extruder. Eventide stores and restores that group together.
 
-See `TESTING.md` for the repeatable no-printer-required regression matrix.
+Eventide never overwrites a quality profile when both the local copy and the shared copy changed since the last synchronization. It reports a conflict instead. Unsaved/independent local edits therefore are not silently destroyed.
 
-## Cross-PC sync (0.7.1)
+Quality records are scoped to an Eventide printer record for synchronization. Cura itself exposes custom profiles by **quality definition**, not by unique machine instance. Printers with unique quality definitions therefore behave machine-specific; generic/custom printers that share Cura's `fdmprinter` quality definition may still show the same installed custom profile in Cura's native profile list. Eventide does not currently override Cura's native filtering behavior.
 
-On the source Cura install, select the custom material and printer and click **Register Current Selection**. Eventide upgrades the shared filament record with Cura's serialized material definition and the printer record with machine `definitionChanges`. On another Cura install, click **Sync Library to Cura**. Missing custom materials are imported while preserving their GUID. Missing machine instances are recreated from the same installed base definition and receive the published machine definition changes. Temporary quality/user slicing overrides are intentionally not copied.
+## Still not finished
+
+- conflict-resolution UI for quality-profile edit conflicts
+- synchronized deletion/tombstones for quality profiles
+- syncing third-party custom machine `.def.json` files that are absent on the target Cura
+- final G-code hard-limit/PA stamping for multi-extruder slices
+- polished public installer / Cura Marketplace packaging
+
+## Beta testing
+
+See `TESTING.md`. Please use **Advanced → Export diagnostics** when filing a bug. The diagnostics report includes local machine/path information, so review it before sharing publicly.
