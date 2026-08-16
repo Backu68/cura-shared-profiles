@@ -1,21 +1,31 @@
 # Changelog
 
+## 0.8.0-beta
+
+- Added two-way synchronization of Cura custom quality profiles.
+- Preserves Cura's global + per-extruder `quality_changes` grouping.
+- Added stable Eventide quality-profile IDs so profiles can round-trip across PCs.
+- Added quality-profile revision/content-hash conflict protection.
+- Added live SMB-friendly shared-library polling and automatic sync on library changes.
+- Library watcher now fingerprints the shared record directories rather than relying only on `.eventide/library.json`.
+- Added native **Browse…** folder selection for the library path.
+- Reworked the UI to three normal tabs: Library, Profiles, Capability.
+- Moved validation, diagnostics and engine status to an Advanced area.
+- Removed normal-workflow IDs, material inspection, resolver test controls, and verbose engine/G-code status text.
+
 ## 0.7.1-beta
-- Publish portable custom Cura material XML during registration.
-- Import missing published materials on another Cura install while preserving material GUID identity.
-- Publish machine-instance base definition ID and `definitionChanges` without transient slicing/user overrides.
-- Recreate missing machine instances when the target Cura has the same base definition.
-- Persist local Eventide-to-Cura machine bindings to avoid duplicate recreation.
-- Add explicit **Sync Library to Cura** action, sync diagnostics, payload hash validation, and safe failure for missing base machine definitions.
 
-## 0.7.0 Beta
+- Added portable custom-material publish/import with preserved GUID.
+- Added machine-instance publish/recreation when the target has the same Cura base definition.
+- Added explicit Sync Library to Cura action.
 
-- Added material flow (%) capability field and transient CuraEngine propagation.
-- Added persistent per-printer/extruder/nozzle nozzle-material binding.
-- Added 3-second shared-library manifest polling and inventory refresh.
-- Added shared-library JSON/schema/reference validation.
-- Added local diagnostic report export for beta bug reports.
-- Added explicit calibration status and opt-in "mark calibrated" saves.
-- Normal capability saves no longer automatically update the calibration timestamp.
-- Added safe multi-extruder behavior: final G-code guardrail and Klipper PA stamp are skipped instead of guessing a tool.
-- Preserved v0.6 transient slice architecture, hard linear/volumetric guardrails, optimistic revision conflict checks, and atomic writes.
+## 0.7.0-beta
+
+- Added material-flow capability override.
+- Added persistent nozzle-material bindings.
+- Added library polling, validation, diagnostics, and beta hardening.
+
+## 0.6.2
+
+- Automatic post-startup slice hook.
+- Transient capability resolver verified without opening Eventide first.

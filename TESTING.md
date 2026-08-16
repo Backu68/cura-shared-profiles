@@ -1,84 +1,67 @@
-# Eventide Shared Profiles 0.7.0 Beta Test Matrix
+# Eventide Shared Profiles 0.8.0 Beta Test Matrix
 
-These tests do not require a functioning printer unless explicitly noted.
+No printer hardware is required for these tests.
 
-## 1. Startup / hook
+## A. Fresh install / connection
 
-- Restart Cura.
-- Do not open Eventide.
-- Slice with a material that has a saved capability.
-- Expected: capability affects the slice automatically.
-- Open Eventide afterward; **Slice Hook** should show **ACTIVE**.
+1. Install Cura 5.13.x on a clean workstation.
+2. Install Eventide Shared Profiles and restart Cura.
+3. Open Eventide and use **Browse…** to select the shared library.
+4. Click **Connect**.
 
-## 2. Managed → unmanaged → managed selection
+Expected: the library connects without typing a UNC path manually; existing shared machines/materials synchronize.
 
-- Slice a material with an Eventide capability.
-- Switch to a material with no matching capability and reslice.
-- Switch back and reslice.
-- Expected: Eventide applies only to the managed material. No stale header, PA, temperatures, speeds, or retraction values may leak into the unmanaged slice.
+## B. Material and machine bootstrap
 
-## 3. Material-flow propagation (no printer required)
+On PC1 choose a custom material and printer, then click **Share current setup**. On PC2 connect/sync.
 
-- Save a clearly different **Material flow (%)**, for example 80.
-- Slice a known model.
-- Expected: Eventide header includes `EVENTIDE_FLOW_PERCENT=80.0` (format may vary), and CuraEngine output extrusion values/filament use change accordingly.
-- Restore the field to blank after the test.
+Expected: missing custom material appears with the same material GUID; missing machine instance appears when its base Cura definition exists locally.
 
-## 4. Linear hard limit
+## C. Quality-profile first sync
 
-- Set a deliberately low max linear speed and a very high volumetric limit.
-- Slice/export G-code.
-- Expected: `EVENTIDE_GCODE_MAX_SPEED_AFTER_MM_S` is at or below the requested ceiling.
+1. On PC1 create/save a Cura custom quality profile for a shared printer.
+2. Leave Cura running for several seconds.
+3. On PC2 use the same shared library and printer.
 
-## 5. Volumetric hard limit
+Expected: the custom profile appears in Cura on PC2 without manually exporting/importing a Cura profile.
 
-- Set a very high linear limit and deliberately low volumetric limit.
-- Slice/export G-code.
-- Expected: `EVENTIDE_GCODE_MAX_FLOW_AFTER_MM3_S` is at or below the requested ceiling.
+## D. Live quality update
 
-## 6. Temperature / retraction / PA
+1. Confirm the profile is synchronized on both PCs.
+2. Edit/save that custom profile on PC1.
+3. Wait for live sync on PC2.
 
-- Use diagnostic values only; do not print them.
-- Verify the resulting G-code and Eventide header reflect the configured temperature offset, retraction distance/speed, and optional Klipper pressure advance.
+Expected: PC2's copy updates automatically when PC2 has not changed it locally.
 
-## 7. Nozzle-material binding
+## E. Conflict protection
 
-- Create two capability records for the same printer/material/extruder/nozzle diameter but different nozzle materials.
-- Bind one in **Current Selection → Active nozzle material**.
-- Restart Cura and slice without opening Eventide.
-- Expected: the bound nozzle-material capability resolves automatically.
+1. Start with the same synchronized quality profile on PC1 and PC2.
+2. Make a different edit to the profile on both PCs before either side has received the other's change.
+3. Let live sync run.
 
-## 8. Multi-client revision conflict
+Expected: Eventide reports a quality conflict and does not silently overwrite either local edited copy.
 
-- PC1 loads capability revision N.
-- PC2 loads capability revision N.
-- PC1 saves, producing N+1.
-- PC2 attempts to save its stale editor.
-- Expected: PC2 receives `CAPABILITY CONFLICT` and does not overwrite N+1.
+## F. Quality profile machine scoping
 
-## 9. Live library watcher
+Create two shared printer instances that can both use Cura's generic `fdmprinter` quality definition. Create a custom quality profile under only one Eventide printer.
 
-- Keep Eventide open on PC1.
-- Modify/save a library record on PC2.
-- Expected: PC1 refreshes inventory/status within a few seconds without re-opening the window.
-- The capability editor is intentionally not silently replaced; stale-save revision protection remains authoritative.
+Expected: Eventide's shared record remains associated with the originating Eventide printer. Note that Cura's native custom-profile list is quality-definition based, so another local printer using the same `fdmprinter` quality definition may still display the installed profile. Record ownership and Cura visibility are intentionally treated as separate concepts.
 
-## 10. Library validation
+## G. Capability regression
 
-- Run **Validate Library** on a healthy library: expected `VALIDATION OK` (warnings are allowed for intentionally unset fields).
-- For a controlled test copy only, corrupt a JSON record or break a capability's printer/filament reference.
-- Expected: validation reports the problem; slicing must fail open to untouched Cura settings rather than guessing.
+Repeat the known v0.6/v0.7 no-hardware slice tests:
 
-## Bug reports
+- matching material capability activates automatically
+- switching to an unmatched material returns to plain Cura
+- max linear speed hard ceiling
+- max volumetric flow hard ceiling
+- temperature offset
+- retraction distance/speed
+- material flow multiplier
+- optional Klipper pressure advance
 
-Use **Diagnostics → Export Diagnostics** and attach the report with the Cura log and, when relevant, the generated G-code. Review the diagnostics text before sharing because it contains host/selection IDs and the shared-library path.
+## H. Diagnostics
 
+Open **Library → Advanced**, run Validate and Export diagnostics.
 
-## Cross-PC material and machine sync (0.7.1)
-1. On PC A, select a custom material and printer and click **Register Current Selection**.
-2. Validate the library; the material/printer records should no longer warn that their portable definitions are unpublished.
-3. On PC B, where the custom material is absent, click **Sync Library to Cura**.
-4. Confirm the material appears in Cura and its GUID matches the shared material record.
-5. If the printer is absent but its base definition exists on PC B, confirm Eventide recreates the machine and restores its machine definition changes.
-6. Run Sync again; it must report the material/machine as already local and must not create duplicates.
-7. If a printer record references a base definition PC B does not have, sync must report `missing base definition` and must not guess or install a substitute.
+Expected: validation includes printer, filament, capability and quality record references/hashes. Diagnostics file is created locally.

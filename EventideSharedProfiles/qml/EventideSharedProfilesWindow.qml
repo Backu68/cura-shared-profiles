@@ -8,12 +8,12 @@ import UM 1.3 as UM
 Window {
     id: root
 
-    property string uiStatus: "UI loaded."
+    property string uiStatus: "Ready."
 
-    width: 900
-    height: 700
-    minimumWidth: 760
-    minimumHeight: 560
+    width: 860
+    height: 660
+    minimumWidth: 720
+    minimumHeight: 540
     modality: Qt.NonModal
     color: UM.Theme.getColor("main_background")
     title: "Eventide Shared Profiles"
@@ -34,6 +34,9 @@ Window {
     }
 
     function loadCapability() {
+        if (libraryPath.text.length === 0) {
+            return
+        }
         uiStatus = eventideBridge.loadCurrentCapability(libraryPath.text)
         if (eventideBridge.capabilityLoaded) {
             populateCapabilityFields()
@@ -56,12 +59,7 @@ Window {
             "notes": capabilityNotes.text,
             "mark_calibrated": markCalibrated.checked
         }
-
-        uiStatus = eventideBridge.saveCurrentCapability(
-            libraryPath.text,
-            JSON.stringify(payload)
-        )
-
+        uiStatus = eventideBridge.saveCurrentCapability(libraryPath.text, JSON.stringify(payload))
         if (uiStatus.indexOf("CAPABILITY SAVED:") === 0) {
             populateCapabilityFields()
         }
@@ -75,49 +73,43 @@ Window {
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 18
+        anchors.margins: 16
         spacing: 10
 
         RowLayout {
             Layout.fillWidth: true
 
             ColumnLayout {
-                spacing: 2
-
+                spacing: 1
                 Label {
                     text: "Eventide Shared Profiles"
-                    font.pixelSize: 22
+                    color: UM.Theme.getColor("text")
+                    font.pixelSize: 20
                     font.bold: true
-                    color: UM.Theme.getColor("text")
                 }
-
                 Label {
-                    text: "v0.7.1 beta — release hardening"
+                    text: "Shared Cura profiles and printer/material capabilities"
                     color: UM.Theme.getColor("text")
-                    opacity: 0.7
+                    opacity: 0.65
                 }
             }
-
             Item { Layout.fillWidth: true }
-
             Label {
-                text: eventideBridge.currentRegistration
+                text: "v0.8.0 beta"
                 color: UM.Theme.getColor("text")
-                opacity: 0.8
+                opacity: 0.6
             }
         }
 
         Rectangle {
             Layout.fillWidth: true
-            implicitHeight: statusLabel.implicitHeight + 16
-            color: UM.Theme.getColor("main_background")
-            border.width: 1
-            border.color: UM.Theme.getColor("lining")
-
+            implicitHeight: statusText.implicitHeight + 14
+            radius: 4
+            color: UM.Theme.getColor("lining")
             Label {
-                id: statusLabel
+                id: statusText
                 anchors.fill: parent
-                anchors.margins: 8
+                anchors.margins: 7
                 text: root.uiStatus
                 color: UM.Theme.getColor("text")
                 wrapMode: Text.WordWrap
@@ -127,145 +119,157 @@ Window {
         TabBar {
             id: tabs
             Layout.fillWidth: true
+            onCurrentIndexChanged: {
+                if (currentIndex === 1) {
+                    eventideBridge.refreshSelection()
+                    toolheadMaterial.text = eventideBridge.activeNozzleMaterial
+                } else if (currentIndex === 2) {
+                    eventideBridge.refreshSelection()
+                    loadCapability()
+                }
+            }
 
             TabButton { text: "Library" }
-            TabButton { text: "Current Selection" }
+            TabButton { text: "Profiles" }
             TabButton { text: "Capability" }
-            TabButton { text: "Diagnostics" }
         }
 
         StackLayout {
-            id: pages
             currentIndex: tabs.currentIndex
             Layout.fillWidth: true
             Layout.fillHeight: true
 
-            // ----------------------------------------------------------
-            // Library tab
-            // ----------------------------------------------------------
+            // Library -------------------------------------------------
             Item {
                 ColumnLayout {
                     anchors.fill: parent
                     spacing: 12
 
                     GroupBox {
-                        title: "Shared Profile Library"
+                        title: "Shared library"
                         Layout.fillWidth: true
 
                         ColumnLayout {
                             anchors.fill: parent
-                            spacing: 10
-
-                            TextField {
-                                id: libraryPath
-                                Layout.fillWidth: true
-                                selectByMouse: true
-                                placeholderText: "\\\\server\\share\\CuraProfiles"
-                            }
+                            spacing: 8
 
                             RowLayout {
                                 Layout.fillWidth: true
-                                spacing: 8
-
-                                Button {
-                                    text: "Save Path"
-                                    onClicked: uiStatus = eventideBridge.saveSharedLibraryPath(libraryPath.text)
+                                TextField {
+                                    id: libraryPath
+                                    Layout.fillWidth: true
+                                    selectByMouse: true
+                                    placeholderText: "Choose the shared Cura library folder"
                                 }
                                 Button {
-                                    text: "Test Connection"
-                                    onClicked: uiStatus = eventideBridge.testConnection(libraryPath.text)
-                                }
-                                Button {
-                                    text: "Initialize Library"
-                                    onClicked: uiStatus = eventideBridge.initializeLibrary(libraryPath.text)
-                                }
-                                Button {
-                                    text: "Refresh Library"
-                                    onClicked: uiStatus = eventideBridge.refreshLibrary(libraryPath.text)
-                                }
-                                Button {
-                                    text: "Validate Library"
-                                    onClicked: uiStatus = eventideBridge.validateLibrary(libraryPath.text)
-                                }
-                                Item { Layout.fillWidth: true }
-                            }
-
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 8
-
-                                Button {
-                                    text: "Sync Library to Cura"
+                                    text: "Browse…"
                                     onClicked: {
-                                        uiStatus = eventideBridge.syncLibraryToCura(libraryPath.text)
-                                        eventideBridge.refreshSelection()
+                                        var selected = eventideBridge.browseForLibraryPath()
+                                        if (selected.length > 0) {
+                                            libraryPath.text = selected
+                                        }
                                     }
                                 }
-                                Label {
-                                    text: "Installs missing published materials and recreates missing machine instances. Does not copy temporary slicing overrides."
-                                    color: UM.Theme.getColor("text")
-                                    wrapMode: Text.WordWrap
-                                    Layout.fillWidth: true
+                                Button {
+                                    text: "Connect"
+                                    highlighted: true
+                                    onClicked: uiStatus = eventideBridge.connectLibrary(libraryPath.text)
                                 }
                             }
-                        }
-                    }
 
-                    GroupBox {
-                        title: "Shared Library Inventory"
-                        Layout.fillWidth: true
-
-                        GridLayout {
-                            anchors.fill: parent
-                            columns: 4
-                            columnSpacing: 24
-                            rowSpacing: 6
-
-                            Label { text: "Printers"; font.bold: true; color: UM.Theme.getColor("text") }
-                            Label { text: eventideBridge.printerCount.toString(); color: UM.Theme.getColor("text") }
-
-                            Label { text: "Filaments"; font.bold: true; color: UM.Theme.getColor("text") }
-                            Label { text: eventideBridge.filamentCount.toString(); color: UM.Theme.getColor("text") }
-
-                            Label { text: "Capabilities"; font.bold: true; color: UM.Theme.getColor("text") }
-                            Label { text: eventideBridge.capabilityCount.toString(); color: UM.Theme.getColor("text") }
-
-                            Label { text: "Quality Profiles"; font.bold: true; color: UM.Theme.getColor("text") }
-                            Label { text: eventideBridge.qualityCount.toString(); color: UM.Theme.getColor("text") }
-                        }
-                    }
-
-                    GroupBox {
-                        title: "Cura Sync"
-                        Layout.fillWidth: true
-
-                        ColumnLayout {
-                            anchors.fill: parent
-                            Label {
-                                text: eventideBridge.lastSyncSummary
-                                color: UM.Theme.getColor("text")
-                                wrapMode: Text.WordWrap
-                                Layout.fillWidth: true
-                            }
-                        }
-                    }
-
-                    GroupBox {
-                        title: "Live Library Watch"
-                        Layout.fillWidth: true
-
-                        ColumnLayout {
-                            anchors.fill: parent
                             Label {
                                 text: eventideBridge.lastLibraryEvent
                                 color: UM.Theme.getColor("text")
                                 wrapMode: Text.WordWrap
                                 Layout.fillWidth: true
                             }
+                        }
+                    }
+
+                    GroupBox {
+                        title: "Library contents"
+                        Layout.fillWidth: true
+
+                        RowLayout {
+                            anchors.fill: parent
+                            spacing: 18
+                            Label { text: eventideBridge.printerCount + " printers"; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.filamentCount + " materials"; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.qualityCount + " quality profiles"; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.capabilityCount + " capabilities"; color: UM.Theme.getColor("text") }
+                            Item { Layout.fillWidth: true }
+                        }
+                    }
+
+                    GroupBox {
+                        title: "Synchronization"
+                        Layout.fillWidth: true
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            spacing: 8
+                            Label {
+                                text: eventideBridge.lastSyncSummary
+                                color: UM.Theme.getColor("text")
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+                            Label {
+                                text: eventideBridge.lastQualitySyncSummary
+                                color: UM.Theme.getColor("text")
+                                opacity: 0.8
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+                            RowLayout {
+                                Button {
+                                    text: "Sync now"
+                                    onClicked: {
+                                        uiStatus = eventideBridge.syncLibraryToCura(libraryPath.text)
+                                        eventideBridge.refreshSelection()
+                                    }
+                                }
+                                Item { Layout.fillWidth: true }
+                                CheckBox {
+                                    id: showAdvanced
+                                    text: "Advanced"
+                                }
+                            }
+                        }
+                    }
+
+                    GroupBox {
+                        title: "Advanced"
+                        Layout.fillWidth: true
+                        visible: showAdvanced.checked
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            spacing: 8
+                            RowLayout {
+                                Button {
+                                    text: "Create library"
+                                    onClicked: uiStatus = eventideBridge.initializeLibrary(libraryPath.text)
+                                }
+                                Button {
+                                    text: "Validate"
+                                    onClicked: uiStatus = eventideBridge.validateLibrary(libraryPath.text)
+                                }
+                                Button {
+                                    text: "Export diagnostics"
+                                    onClicked: uiStatus = eventideBridge.exportDiagnostics()
+                                }
+                                Item { Layout.fillWidth: true }
+                                Label {
+                                    text: eventideBridge.sliceHookActive ? "Slice engine ready" : "Slice engine not ready"
+                                    color: UM.Theme.getColor("text")
+                                    opacity: 0.65
+                                }
+                            }
                             Label {
                                 text: eventideBridge.libraryValidationSummary
                                 color: UM.Theme.getColor("text")
-                                opacity: 0.75
+                                opacity: 0.7
                                 wrapMode: Text.WordWrap
                                 Layout.fillWidth: true
                             }
@@ -276,142 +280,95 @@ Window {
                 }
             }
 
-            // ----------------------------------------------------------
-            // Current Selection tab
-            // ----------------------------------------------------------
+            // Profiles ------------------------------------------------
             Item {
                 ColumnLayout {
                     anchors.fill: parent
                     spacing: 12
 
                     GroupBox {
-                        title: "Current Cura Selection"
+                        title: "Current Cura setup"
                         Layout.fillWidth: true
 
+                        GridLayout {
+                            anchors.fill: parent
+                            columns: 2
+                            columnSpacing: 18
+                            rowSpacing: 8
+
+                            Label { text: "Printer"; font.bold: true; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.activePrinterName; color: UM.Theme.getColor("text"); Layout.fillWidth: true }
+
+                            Label { text: "Material"; font.bold: true; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.activeMaterialName; color: UM.Theme.getColor("text"); Layout.fillWidth: true }
+
+                            Label { text: "Nozzle"; font.bold: true; color: UM.Theme.getColor("text") }
+                            Label {
+                                text: eventideBridge.activeNozzleDiameter.length > 0 ? eventideBridge.activeNozzleDiameter + " mm" : "—"
+                                color: UM.Theme.getColor("text")
+                                Layout.fillWidth: true
+                            }
+
+                            Label { text: "Shared"; font.bold: true; color: UM.Theme.getColor("text") }
+                            Label { text: eventideBridge.currentRegistration; color: UM.Theme.getColor("text"); Layout.fillWidth: true }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label { text: "Nozzle material"; color: UM.Theme.getColor("text") }
+                        TextField {
+                            id: toolheadMaterial
+                            Layout.fillWidth: true
+                            placeholderText: "e.g. Brass"
+                            selectByMouse: true
+                        }
+                        Button {
+                            text: "Save"
+                            onClicked: {
+                                uiStatus = eventideBridge.setActiveNozzleMaterial(toolheadMaterial.text)
+                                toolheadMaterial.text = eventideBridge.activeNozzleMaterial
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Button {
+                            text: "Share current setup"
+                            highlighted: true
+                            onClicked: {
+                                uiStatus = eventideBridge.registerCurrentSelection(libraryPath.text)
+                                loadCapability()
+                            }
+                        }
+                        Label {
+                            text: "Publishes this printer, material and capability to the shared library."
+                            color: UM.Theme.getColor("text")
+                            opacity: 0.7
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+
+                    GroupBox {
+                        title: "Quality profiles"
+                        Layout.fillWidth: true
                         ColumnLayout {
                             anchors.fill: parent
-                            spacing: 10
-
-                            GridLayout {
+                            spacing: 6
+                            Label {
+                                text: eventideBridge.lastQualitySyncSummary
+                                color: UM.Theme.getColor("text")
                                 Layout.fillWidth: true
-                                columns: 2
-                                columnSpacing: 18
-                                rowSpacing: 8
-
-                                Label { text: "Printer"; font.bold: true; color: UM.Theme.getColor("text") }
-                                Label {
-                                    text: eventideBridge.activePrinterName
-                                    color: UM.Theme.getColor("text")
-                                    Layout.fillWidth: true
-                                }
-
-                                Label { text: "Printer ID"; font.bold: true; color: UM.Theme.getColor("text") }
-                                Label {
-                                    text: eventideBridge.activePrinterId.length > 0 ? eventideBridge.activePrinterId : "—"
-                                    color: UM.Theme.getColor("text")
-                                    Layout.fillWidth: true
-                                    elide: Text.ElideMiddle
-                                }
-
-                                Label { text: "Material"; font.bold: true; color: UM.Theme.getColor("text") }
-                                Label {
-                                    text: eventideBridge.activeMaterialName
-                                    color: UM.Theme.getColor("text")
-                                    Layout.fillWidth: true
-                                }
-
-                                Label { text: "Material GUID / ID"; font.bold: true; color: UM.Theme.getColor("text") }
-                                Label {
-                                    text: eventideBridge.activeMaterialId.length > 0 ? eventideBridge.activeMaterialId : "—"
-                                    color: UM.Theme.getColor("text")
-                                    Layout.fillWidth: true
-                                    elide: Text.ElideMiddle
-                                }
-
-                                Label { text: "Extruder"; font.bold: true; color: UM.Theme.getColor("text") }
-                                Label {
-                                    text: eventideBridge.activeExtruderPosition.toString()
-                                    color: UM.Theme.getColor("text")
-                                    Layout.fillWidth: true
-                                }
-
-                                Label { text: "Cura Nozzle"; font.bold: true; color: UM.Theme.getColor("text") }
-                                Label {
-                                    text: eventideBridge.activeNozzleDiameter.length > 0
-                                          ? eventideBridge.activeNozzleDiameter + " mm"
-                                          : "—"
-                                    color: UM.Theme.getColor("text")
-                                    Layout.fillWidth: true
-                                }
-
-                                Label { text: "Slice Hook"; font.bold: true; color: UM.Theme.getColor("text") }
-                                Label {
-                                    text: eventideBridge.sliceHookActive ? "ACTIVE" : "NOT ACTIVE"
-                                    color: UM.Theme.getColor("text")
-                                    font.bold: true
-                                    Layout.fillWidth: true
-                                }
-
-                                Label { text: "Shared Status"; font.bold: true; color: UM.Theme.getColor("text") }
-                                Label {
-                                    text: eventideBridge.currentRegistration
-                                    color: UM.Theme.getColor("text")
-                                    Layout.fillWidth: true
-                                }
+                                wrapMode: Text.WordWrap
                             }
-
-                            RowLayout {
+                            Label {
+                                text: "Saved Cura custom profiles for shared printers are synchronized automatically while Cura is running."
+                                color: UM.Theme.getColor("text")
+                                opacity: 0.65
                                 Layout.fillWidth: true
-                                spacing: 8
-
-                                Label {
-                                    text: "Active nozzle material"
-                                    font.bold: true
-                                    color: UM.Theme.getColor("text")
-                                }
-                                TextField {
-                                    id: toolheadMaterial
-                                    Layout.fillWidth: true
-                                    placeholderText: "e.g. Brass"
-                                    selectByMouse: true
-                                }
-                                Button {
-                                    text: "Bind Toolhead"
-                                    onClicked: {
-                                        uiStatus = eventideBridge.setActiveNozzleMaterial(toolheadMaterial.text)
-                                        toolheadMaterial.text = eventideBridge.activeNozzleMaterial
-                                    }
-                                }
-                            }
-
-                            RowLayout {
-                                spacing: 8
-
-                                Button {
-                                    text: "Register Current Selection"
-                                    onClicked: {
-                                        uiStatus = eventideBridge.registerCurrentSelection(libraryPath.text)
-                                        if (uiStatus.indexOf("REGISTERED:") === 0) {
-                                            loadCapability()
-                                        }
-                                    }
-                                }
-
-                                Button {
-                                    text: "Reload Current Selection"
-                                    onClicked: {
-                                        eventideBridge.refreshSelection()
-                                        toolheadMaterial.text = eventideBridge.activeNozzleMaterial
-                                        loadCapability()
-                                    }
-                                }
-
-                                Button {
-                                    text: "Inspect Material"
-                                    onClicked: uiStatus = eventideBridge.inspectActiveMaterial()
-                                }
-
-                                Item { Layout.fillWidth: true }
+                                wrapMode: Text.WordWrap
                             }
                         }
                     }
@@ -420,9 +377,7 @@ Window {
                 }
             }
 
-            // ----------------------------------------------------------
-            // Capability tab
-            // ----------------------------------------------------------
+            // Capability ----------------------------------------------
             Item {
                 ColumnLayout {
                     anchors.fill: parent
@@ -430,28 +385,16 @@ Window {
 
                     RowLayout {
                         Layout.fillWidth: true
-
                         Label {
                             text: eventideBridge.capabilityLoaded
-                                  ? "Loaded revision " + eventideBridge.capabilityRevision
-                                  : "No capability loaded"
+                                  ? eventideBridge.activePrinterName + " + " + eventideBridge.activeMaterialName
+                                  : "No capability for the current selection"
                             color: UM.Theme.getColor("text")
                             font.bold: true
                         }
-
                         Item { Layout.fillWidth: true }
-
                         Label {
-                            text: "Calibration: " + eventideBridge.capabilityCalibrationStatus
-                            color: UM.Theme.getColor("text")
-                            font.bold: true
-                            opacity: 0.85
-                        }
-
-                        Label {
-                            text: eventideBridge.capabilityLastCalibrated.length > 0
-                                  ? "Last calibrated: " + eventideBridge.capabilityLastCalibrated
-                                  : "Last calibrated: —"
+                            text: eventideBridge.capabilityLoaded ? "Calibration: " + eventideBridge.capabilityCalibrationStatus : ""
                             color: UM.Theme.getColor("text")
                             opacity: 0.75
                         }
@@ -468,9 +411,8 @@ Window {
                             spacing: 12
 
                             GroupBox {
-                                title: "Flow & Motion"
+                                title: "Flow & motion"
                                 Layout.fillWidth: true
-
                                 GridLayout {
                                     anchors.fill: parent
                                     columns: 2
@@ -478,50 +420,25 @@ Window {
                                     rowSpacing: 8
 
                                     Label { text: "Max volumetric flow (mm³/s)"; color: UM.Theme.getColor("text") }
-                                    TextField {
-                                        id: maxFlow
-                                        Layout.fillWidth: true
-                                        placeholderText: "unset"
-                                        selectByMouse: true
-                                    }
+                                    TextField { id: maxFlow; Layout.fillWidth: true; placeholderText: "inherit Cura"; selectByMouse: true }
 
                                     Label { text: "Max linear speed (mm/s)"; color: UM.Theme.getColor("text") }
-                                    TextField {
-                                        id: maxSpeed
-                                        Layout.fillWidth: true
-                                        placeholderText: "unset"
-                                        selectByMouse: true
-                                    }
+                                    TextField { id: maxSpeed; Layout.fillWidth: true; placeholderText: "inherit Cura"; selectByMouse: true }
 
                                     Label { text: "Material flow (%)"; color: UM.Theme.getColor("text") }
-                                    TextField {
-                                        id: materialFlow
-                                        Layout.fillWidth: true
-                                        placeholderText: "unset / inherit Cura"
-                                        selectByMouse: true
-                                    }
+                                    TextField { id: materialFlow; Layout.fillWidth: true; placeholderText: "inherit Cura"; selectByMouse: true }
 
                                     Label { text: "Pressure advance"; color: UM.Theme.getColor("text") }
-                                    TextField {
-                                        id: pressureAdvance
-                                        Layout.fillWidth: true
-                                        placeholderText: "unset"
-                                        selectByMouse: true
-                                    }
+                                    TextField { id: pressureAdvance; Layout.fillWidth: true; placeholderText: "unset"; selectByMouse: true }
 
-
-                                    Label { text: "Pressure advance G-code"; color: UM.Theme.getColor("text") }
-                                    CheckBox {
-                                        id: klipperPa
-                                        text: "Emit Klipper SET_PRESSURE_ADVANCE"
-                                    }
+                                    Label { text: "Klipper pressure advance"; color: UM.Theme.getColor("text") }
+                                    CheckBox { id: klipperPa; text: "Emit SET_PRESSURE_ADVANCE" }
                                 }
                             }
 
                             GroupBox {
-                                title: "Temperature & Retraction"
+                                title: "Temperature & retraction"
                                 Layout.fillWidth: true
-
                                 GridLayout {
                                     anchors.fill: parent
                                     columns: 2
@@ -529,35 +446,19 @@ Window {
                                     rowSpacing: 8
 
                                     Label { text: "Temperature offset (°C)"; color: UM.Theme.getColor("text") }
-                                    TextField {
-                                        id: tempOffset
-                                        Layout.fillWidth: true
-                                        placeholderText: "unset"
-                                        selectByMouse: true
-                                    }
+                                    TextField { id: tempOffset; Layout.fillWidth: true; placeholderText: "inherit Cura"; selectByMouse: true }
 
                                     Label { text: "Retraction distance (mm)"; color: UM.Theme.getColor("text") }
-                                    TextField {
-                                        id: retractDistance
-                                        Layout.fillWidth: true
-                                        placeholderText: "unset"
-                                        selectByMouse: true
-                                    }
+                                    TextField { id: retractDistance; Layout.fillWidth: true; placeholderText: "inherit Cura"; selectByMouse: true }
 
                                     Label { text: "Retraction speed (mm/s)"; color: UM.Theme.getColor("text") }
-                                    TextField {
-                                        id: retractSpeed
-                                        Layout.fillWidth: true
-                                        placeholderText: "unset"
-                                        selectByMouse: true
-                                    }
+                                    TextField { id: retractSpeed; Layout.fillWidth: true; placeholderText: "inherit Cura"; selectByMouse: true }
                                 }
                             }
 
                             GroupBox {
-                                title: "Hotend / Nozzle"
+                                title: "Toolhead"
                                 Layout.fillWidth: true
-
                                 GridLayout {
                                     anchors.fill: parent
                                     columns: 2
@@ -565,251 +466,56 @@ Window {
                                     rowSpacing: 8
 
                                     Label { text: "Nozzle diameter (mm)"; color: UM.Theme.getColor("text") }
-                                    TextField {
-                                        id: nozzleDiameter
-                                        Layout.fillWidth: true
-                                        readOnly: true
-                                        placeholderText: eventideBridge.activeNozzleDiameter.length > 0
-                                                         ? eventideBridge.activeNozzleDiameter
-                                                         : "not detected"
-                                        selectByMouse: true
-                                    }
+                                    TextField { id: nozzleDiameter; Layout.fillWidth: true; readOnly: true; placeholderText: "not detected"; selectByMouse: true }
 
                                     Label { text: "Nozzle material"; color: UM.Theme.getColor("text") }
-                                    TextField {
-                                        id: nozzleMaterial
-                                        Layout.fillWidth: true
-                                        placeholderText: "e.g. Brass"
-                                        selectByMouse: true
-                                    }
+                                    TextField { id: nozzleMaterial; Layout.fillWidth: true; placeholderText: "e.g. Brass"; selectByMouse: true }
                                 }
                             }
 
                             GroupBox {
-                                title: "CuraEngine / G-code Integration"
+                                title: "Calibration notes"
                                 Layout.fillWidth: true
-
                                 ColumnLayout {
                                     anchors.fill: parent
-                                    spacing: 8
-
-                                    Label {
-                                        text: "Eventide now resolves the capability at slice time and changes only "
-                                              + "the copied settings sent to CuraEngine. Cura user settings are not "
-                                              + "modified. A final G-code guardrail enforces hard linear/flow ceilings."
-                                        color: UM.Theme.getColor("text")
-                                        wrapMode: Text.WordWrap
-                                        Layout.fillWidth: true
-                                    }
-
-                                    RowLayout {
-                                        spacing: 8
-
-                                        Button {
-                                            text: "Check Slice Resolver"
-                                            onClicked: {
-                                                uiStatus = eventideBridge.checkSliceResolver(libraryPath.text)
-                                            }
-                                        }
-
-                                        Label {
-                                            text: eventideBridge.sliceHookInstalled
-                                                  ? "Slice-time hook: ACTIVE"
-                                                  : "Slice-time hook: NOT READY"
-                                            color: UM.Theme.getColor("text")
-                                            font.bold: true
-                                        }
-
-                                        Item { Layout.fillWidth: true }
-                                    }
-
-                                    Label {
-                                        text: eventideBridge.lastSliceResolution
-                                        color: UM.Theme.getColor("text")
-                                        opacity: 0.75
-                                        Layout.fillWidth: true
-                                        wrapMode: Text.WordWrap
-                                    }
-
-                                    Label {
-                                        text: eventideBridge.lastGcodeGuardrailSummary
-                                        color: UM.Theme.getColor("text")
-                                        opacity: 0.75
-                                        Layout.fillWidth: true
-                                        wrapMode: Text.WordWrap
-                                    }
-                                }
-                            }
-
-                            GroupBox {
-                                title: "Calibration"
-                                Layout.fillWidth: true
-
-                                ColumnLayout {
-                                    anchors.fill: parent
-                                    spacing: 8
-
+                                    spacing: 6
                                     TextArea {
                                         id: capabilityNotes
                                         Layout.fillWidth: true
-                                        implicitHeight: 100
-                                        placeholderText: "Optional calibration notes"
+                                        implicitHeight: 90
+                                        placeholderText: "Optional notes"
                                         selectByMouse: true
                                         wrapMode: TextEdit.Wrap
                                     }
-
-                                    CheckBox {
-                                        id: markCalibrated
-                                        text: "Mark this save as calibrated"
-                                    }
-
-                                    Label {
-                                        text: "Normal saves no longer change the calibration timestamp. "
-                                              + "If a previously calibrated capability is edited without this box, "
-                                              + "its status becomes needs_recalibration."
-                                        color: UM.Theme.getColor("text")
-                                        opacity: 0.7
-                                        wrapMode: Text.WordWrap
-                                        Layout.fillWidth: true
+                                    RowLayout {
+                                        CheckBox { id: markCalibrated; text: "Mark this save as calibrated" }
+                                        Item { Layout.fillWidth: true }
+                                        Label {
+                                            text: eventideBridge.capabilityLastCalibrated.length > 0 ? "Last calibrated " + eventideBridge.capabilityLastCalibrated : ""
+                                            color: UM.Theme.getColor("text")
+                                            opacity: 0.6
+                                        }
                                     }
                                 }
-                            }
-
-                            Item {
-                                Layout.fillWidth: true
-                                implicitHeight: 8
                             }
                         }
                     }
 
-                    // Keep actions OUTSIDE the ScrollView so they're always visible.
                     RowLayout {
                         Layout.fillWidth: true
-                        spacing: 8
-
                         Button {
-                            text: "Load Capability"
+                            text: "Reload"
                             onClicked: loadCapability()
                         }
-
+                        Item { Layout.fillWidth: true }
                         Button {
-                            text: "Save Capability"
+                            text: "Save capability"
+                            highlighted: true
                             enabled: eventideBridge.capabilityLoaded
                             onClicked: saveCapability()
                         }
-
-                        Item { Layout.fillWidth: true }
-
-                        Label {
-                            text: eventideBridge.capabilityLoaded
-                                  ? eventideBridge.capabilityRecordId
-                                  : ""
-                            color: UM.Theme.getColor("text")
-                            opacity: 0.55
-                            elide: Text.ElideMiddle
-                            Layout.preferredWidth: 300
-                            horizontalAlignment: Text.AlignRight
-                        }
                     }
                 }
-            }
-
-            // ----------------------------------------------------------
-            // Diagnostics tab
-            // ----------------------------------------------------------
-            Item {
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: 12
-
-                    GroupBox {
-                        title: "Beta Safety / Runtime"
-                        Layout.fillWidth: true
-
-                        GridLayout {
-                            anchors.fill: parent
-                            columns: 2
-                            columnSpacing: 18
-                            rowSpacing: 8
-
-                            Label { text: "Slice hook"; font.bold: true; color: UM.Theme.getColor("text") }
-                            Label { text: eventideBridge.sliceHookActive ? "ACTIVE" : "NOT ACTIVE"; color: UM.Theme.getColor("text") }
-
-                            Label { text: "Last slice"; font.bold: true; color: UM.Theme.getColor("text") }
-                            Label { text: eventideBridge.lastSliceResolution; color: UM.Theme.getColor("text"); wrapMode: Text.WordWrap; Layout.fillWidth: true }
-
-                            Label { text: "G-code guardrail"; font.bold: true; color: UM.Theme.getColor("text") }
-                            Label { text: eventideBridge.lastGcodeGuardrailSummary; color: UM.Theme.getColor("text"); wrapMode: Text.WordWrap; Layout.fillWidth: true }
-
-                            Label { text: "Library watcher"; font.bold: true; color: UM.Theme.getColor("text") }
-                            Label { text: eventideBridge.lastLibraryEvent; color: UM.Theme.getColor("text"); wrapMode: Text.WordWrap; Layout.fillWidth: true }
-
-                            Label { text: "Library validation"; font.bold: true; color: UM.Theme.getColor("text") }
-                            Label { text: eventideBridge.libraryValidationSummary; color: UM.Theme.getColor("text"); wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                        }
-                    }
-
-                    GroupBox {
-                        title: "Bug Report Tools"
-                        Layout.fillWidth: true
-
-                        ColumnLayout {
-                            anchors.fill: parent
-                            spacing: 8
-
-                            Label {
-                                text: "Export Diagnostics writes a local text report containing plugin/runtime state, "
-                                      + "selection IDs, library path, and the last resolver/guardrail results. Review it "
-                                      + "before sharing if the library path or host name is sensitive."
-                                color: UM.Theme.getColor("text")
-                                wrapMode: Text.WordWrap
-                                Layout.fillWidth: true
-                            }
-
-                            RowLayout {
-                                Button {
-                                    text: "Validate Library"
-                                    onClicked: uiStatus = eventideBridge.validateLibrary(libraryPath.text)
-                                }
-                                Button {
-                                    text: "Export Diagnostics"
-                                    onClicked: uiStatus = eventideBridge.exportDiagnostics()
-                                }
-                                Item { Layout.fillWidth: true }
-                            }
-                        }
-                    }
-
-                    GroupBox {
-                        title: "Known Beta Limitation"
-                        Layout.fillWidth: true
-                        Label {
-                            anchors.fill: parent
-                            text: "Final G-code hard-limit enforcement and Klipper PA stamping are currently single-extruder only. "
-                                  + "On multi-extruder slices Eventide applies transient CuraEngine settings per extruder but safely skips the final G-code guardrail/PA stamp rather than guessing."
-                            color: UM.Theme.getColor("text")
-                            wrapMode: Text.WordWrap
-                        }
-                    }
-
-                    Item { Layout.fillHeight: true }
-                }
-            }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-
-            Button {
-                text: "Test Python Hook"
-                onClicked: uiStatus = eventideBridge.ping()
-            }
-
-            Item { Layout.fillWidth: true }
-
-            Button {
-                text: "Close"
-                onClicked: root.hide()
             }
         }
     }
