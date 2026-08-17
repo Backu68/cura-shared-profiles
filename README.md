@@ -1,4 +1,4 @@
-# Eventide Shared Profiles 0.8.0 Beta
+# Eventide Shared Profiles 0.8.6 Beta
 
 Eventide Shared Profiles is an early beta plugin for UltiMaker Cura 5.13.x that keeps selected Cura configuration objects in a shared filesystem library (including SMB/NAS paths) while leaving Cura itself local and responsive.
 
@@ -14,7 +14,12 @@ Working now:
   - stable cross-PC Eventide identity
   - revision/content-hash conflict protection
 - **live shared-library polling** (SMB-friendly; no native filesystem watcher required)
+- automatic modal alert when a new quality-profile conflict is detected, even if the main Eventide window is closed
+- visible quality-profile conflict queue with explicit **Keep This PC**, **Use Shared Version**, and **Create New Profile** resolution
 - automatic synchronization when shared records change
+- synchronized quality-profile deletion using persistent tombstones
+- safe removal of a remotely deleted profile even when that custom profile is currently active
+- publisher-version stamping and stale-plugin overwrite protection
 - printer + material + extruder + nozzle capability records
 - transient slice-time capability injection without persistent Cura `userChanges`
 - max linear-speed and max volumetric-flow enforcement
@@ -38,14 +43,26 @@ Working now:
 
 Cura represents one visible custom profile as a group containing a global `quality_changes` container and one container per extruder. Eventide stores and restores that group together.
 
-Eventide never overwrites a quality profile when both the local copy and the shared copy changed since the last synchronization. It reports a conflict instead. Unsaved/independent local edits therefore are not silently destroyed.
+Eventide never overwrites a quality profile when both the local copy and the shared copy changed since the last synchronization. It reports the conflict in the normal **Profiles** tab and offers three explicit resolutions:
+
+- **Keep This PC** — publish this PC's edit as an authoritative shared resolution; clients still holding the resolved losing/baseline version automatically accept the chosen winner.
+- **Use Shared Version** — replace this PC's conflicting copy with the current NAS version.
+- **Create New Profile** — preserve this PC's edit under an editable new profile name, then restore the original profile to the current shared version.
+
+A later independent edit that is not part of the resolved conflict remains protected; Eventide does not use a Keep This PC decision to bulldoze unrelated new work.
 
 Quality records are scoped to an Eventide printer record for synchronization. Cura itself exposes custom profiles by **quality definition**, not by unique machine instance. Printers with unique quality definitions therefore behave machine-specific; generic/custom printers that share Cura's `fdmprinter` quality definition may still show the same installed custom profile in Cura's native profile list. Eventide does not currently override Cura's native filtering behavior.
 
+### Deletion synchronization
+
+Deleting a previously synchronized custom quality profile publishes a persistent tombstone rather than erasing its NAS record. Other connected clients remove the corresponding Eventide-managed Cura containers, and an offline client that returns later cannot republish its stale baseline copy. A new profile may reuse the same visible name, but receives a new Eventide quality ID. Tombstones are retained indefinitely in the current beta.
+
+If deletion races with an independent edit, Eventide does not guess. The conflict offers **Accept Deletion**, **Keep as New Profile**, and **Restore Profile**. If the deleting PC discovers that the shared copy was edited first, it must explicitly choose whether to delete that newer edit or restore it locally.
+
+Every newly written shared JSON record and the manifest include `publisher_plugin_version`. If a client encounters data published by a newer Eventide plugin, it refuses to overwrite that data and reports **PLUGIN UPDATE REQUIRED**. Older unstamped records remain readable.
+
 ## Still not finished
 
-- conflict-resolution UI for quality-profile edit conflicts
-- synchronized deletion/tombstones for quality profiles
 - syncing third-party custom machine `.def.json` files that are absent on the target Cura
 - final G-code hard-limit/PA stamping for multi-extruder slices
 - polished public installer / Cura Marketplace packaging

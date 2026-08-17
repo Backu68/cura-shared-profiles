@@ -28,7 +28,10 @@ class EventideSharedProfiles(QObject, Extension):
     stateChanged = pyqtSignal()
 
     CONFIG_FILENAME = "eventide_shared_profiles.json"
-    PLUGIN_VERSION = "0.8.0"
+    PLUGIN_VERSION = "0.8.6"
+    PUBLISHER_PLUGIN_VERSION = "0.8.6-beta"
+    QUALITY_SCHEMA = "eventide.shared_profiles.quality"
+    QUALITY_TOMBSTONE_SCHEMA = "eventide.shared_profiles.quality_tombstone"
     LIBRARY_FORMAT = 1
     RECORD_FORMAT = 1
     LIBRARY_POLL_INTERVAL_MS = 2500
@@ -94,6 +97,13 @@ class EventideSharedProfiles(QObject, Extension):
         self._last_quality_sync_summary = "No shared quality-profile activity yet."
         self._machine_bindings: Dict[str, str] = {}
         self._quality_sync_state: Dict[str, Dict[str, Any]] = {}
+        # Runtime conflict queue. Conflicts are rediscovered from local/shared
+        # hashes after restart, so the queue itself does not need persistence.
+        self._quality_conflicts: Dict[str, Dict[str, Any]] = {}
+        self._quality_conflict_order: List[str] = []
+        self._quality_conflict_index = 0
+        self._quality_conflict_dialog: Optional[QObject] = None
+        self._last_quality_conflict_popup_token = ""
         self._live_sync_busy = False
 
         self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -207,7 +217,37 @@ class EventideSharedProfiles(QObject, Extension):
         return {"client_id": self._client_id, "hostname": socket.gethostname()}
 
     @staticmethod
-    def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
+    def _version_tuple(version: str) -> Tuple[int, int, int]:
+        """Compare Eventide publisher versions without caring about beta suffix text."""
+        numbers = [int(value) for value in re.findall(r"\d+", str(version or ""))[:3]]
+        while len(numbers) < 3:
+            numbers.append(0)
+        return tuple(numbers[:3])
+
+    def _assert_publisher_compatible(self, payload: Dict[str, Any], context: str = "shared data") -> None:
+        published = str(payload.get("publisher_plugin_version", "") or "").strip()
+        if not published:
+            return  # Backward-compatible with pre-0.8.6 records.
+        if self._version_tuple(published) > self._version_tuple(self.PUBLISHER_PLUGIN_VERSION):
+            raise RuntimeError(
+                "PLUGIN UPDATE REQUIRED: {} was published by Eventide {}, newer than this plugin ({}).".format(
+                    context, published, self.PUBLISHER_PLUGIN_VERSION
+                )
+            )
+
+    def _stamp_publisher_version(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        stamped = dict(payload)
+        schema = str(stamped.get("schema", "") or "")
+        is_manifest = (
+            str(stamped.get("name", "") or "") == "Eventide Shared Profiles"
+            and "record_format" in stamped
+        )
+        if schema.startswith("eventide.shared_profiles.") or is_manifest:
+            stamped["publisher_plugin_version"] = self.PUBLISHER_PLUGIN_VERSION
+        return stamped
+
+    def _atomic_write_json(self, path: str, payload: Dict[str, Any]) -> None:
+        payload = self._stamp_publisher_version(payload)
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -226,12 +266,12 @@ class EventideSharedProfiles(QObject, Extension):
             except OSError:
                 pass
 
-    @staticmethod
-    def _read_json(path: str) -> Dict[str, Any]:
+    def _read_json(self, path: str) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         if not isinstance(data, dict):
             raise ValueError("JSON root must be an object")
+        self._assert_publisher_compatible(data, os.path.basename(path))
         return data
 
     @staticmethod
@@ -496,6 +536,33 @@ class EventideSharedProfiles(QObject, Extension):
         manifest["record_format"] = self.RECORD_FORMAT
         self._atomic_write_json(manifest_path, manifest)
 
+    def _shared_printer_record_id(self, local_printer_id: Optional[str] = None) -> str:
+        """Resolve the stable Eventide printer record for the active/local Cura machine.
+
+        Imported machine instances may receive a different local Cura container id on
+        each computer.  Eventide stamps the shared record id onto imported stacks and
+        also persists a record->local binding; prefer those identities before falling
+        back to the legacy hash of the local Cura id.
+        """
+        local_id = str(local_printer_id or self._active_printer_id or "").strip()
+        if not local_id:
+            raise ValueError("Cura does not have an active printer id")
+
+        try:
+            global_stack = self._application.getGlobalContainerStack()
+            if global_stack is not None and str(global_stack.getId() or "").strip() == local_id:
+                shared_id = str(global_stack.getMetaDataEntry("eventide_record_id", "") or "").strip()
+                if shared_id:
+                    return shared_id
+        except Exception:
+            pass
+
+        for record_id, bound_local_id in self._machine_bindings.items():
+            if str(bound_local_id or "").strip() == local_id and str(record_id or "").strip():
+                return str(record_id).strip()
+
+        return self._stable_id("printer", local_id)
+
     def _base_record_ids(self) -> Tuple[str, str]:
         if not self._active_printer_id:
             raise ValueError("Cura does not have an active printer id")
@@ -503,7 +570,7 @@ class EventideSharedProfiles(QObject, Extension):
             raise ValueError("Cura does not have an active material id")
 
         return (
-            self._stable_id("printer", self._active_printer_id),
+            self._shared_printer_record_id(self._active_printer_id),
             self._stable_id("filament", self._active_material_id),
         )
 
@@ -926,7 +993,7 @@ class EventideSharedProfiles(QObject, Extension):
             nozzle,
         ) = self._slice_identity_for_stack(stack, settings)
 
-        printer_record_id = self._stable_id("printer", printer_id)
+        printer_record_id = self._shared_printer_record_id(printer_id)
         filament_record_id = self._stable_id("filament", material_id)
         folder = os.path.join(root, "capabilities")
         candidates = []
@@ -2012,9 +2079,243 @@ class EventideSharedProfiles(QObject, Extension):
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def _current_printer_record_id(self) -> str:
-        if not self._active_printer_id:
-            raise ValueError("Cura does not have an active printer id")
-        return self._stable_id("printer", self._active_printer_id)
+        return self._shared_printer_record_id(self._active_printer_id)
+
+    @staticmethod
+    def _quality_resolution(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Return validated human-resolution metadata from a shared quality record.
+
+        A Keep This PC resolution is authoritative only for the conflict state it
+        resolved. Receivers may automatically accept the winning hash when their
+        local copy is the known losing hash (or is still at their last synchronized
+        baseline). A later independent local edit remains protected as a conflict.
+        """
+        raw = record.get("resolution", {})
+        if not isinstance(raw, dict):
+            return {}
+        resolution_id = str(raw.get("id", "") or "").strip()
+        if not resolution_id or str(raw.get("strategy", "") or "").strip() != "keep_local":
+            return {}
+        losing_hashes = raw.get("losing_hashes", [])
+        if not isinstance(losing_hashes, list):
+            losing_hashes = []
+        return {
+            "id": resolution_id,
+            "strategy": "keep_local",
+            "winning_hash": str(raw.get("winning_hash", "") or record.get("content_hash", "") or ""),
+            "losing_hashes": [str(value) for value in losing_hashes if str(value or "").strip()],
+            "supersedes_revision": int(raw.get("supersedes_revision", 0) or 0),
+        }
+
+    def _register_quality_conflict(self, quality_id: str, record: Dict[str, Any], local_payload: Dict[str, Any]) -> None:
+        """Remember an edit conflict so the normal Profiles UI can resolve it."""
+        quality_id = str(quality_id or "").strip()
+        if not quality_id:
+            return
+        remote_writer = record.get("updated_by", {}) if isinstance(record.get("updated_by", {}), dict) else {}
+        entry = {
+            "kind": "edit",
+            "quality_id": quality_id,
+            "name": str(local_payload.get("name", "") or record.get("name", "") or "Shared Profile"),
+            "printer_id": str(record.get("printer_id", "") or local_payload.get("printer_id", "") or ""),
+            "remote_revision": int(record.get("revision", 0) or 0),
+            "remote_hostname": str(remote_writer.get("hostname", "") or "another computer"),
+            "remote_client_id": str(remote_writer.get("client_id", "") or ""),
+            "remote_hash": str(record.get("content_hash", "") or ""),
+            "local_hash": str(local_payload.get("content_hash", "") or ""),
+        }
+        self._quality_conflicts[quality_id] = entry
+        if quality_id not in self._quality_conflict_order:
+            self._quality_conflict_order.append(quality_id)
+        if self._quality_conflict_index >= len(self._quality_conflict_order):
+            self._quality_conflict_index = max(0, len(self._quality_conflict_order) - 1)
+
+        # Surface a newly detected conflict even when the main Eventide window
+        # is closed. The token includes both sides' hashes so the same conflict
+        # is shown once, while a later independent conflict can alert again.
+        popup_token = "{}:{}:{}:{}:{}".format(
+            entry.get("kind", "edit"),
+            quality_id,
+            entry["remote_revision"],
+            entry["remote_hash"],
+            entry["local_hash"],
+        )
+        if popup_token != self._last_quality_conflict_popup_token:
+            self._last_quality_conflict_popup_token = popup_token
+            QTimer.singleShot(0, self._show_quality_conflict_dialog)
+
+    def _clear_quality_conflict(self, quality_id: str) -> None:
+        quality_id = str(quality_id or "").strip()
+        self._quality_conflicts.pop(quality_id, None)
+        self._quality_conflict_order = [item for item in self._quality_conflict_order if item != quality_id]
+        if not self._quality_conflict_order:
+            self._quality_conflict_index = 0
+            if self._quality_conflict_dialog is not None:
+                try:
+                    self._quality_conflict_dialog.hide()
+                except Exception:
+                    pass
+        elif self._quality_conflict_index >= len(self._quality_conflict_order):
+            self._quality_conflict_index = len(self._quality_conflict_order) - 1
+
+    def _show_quality_conflict_dialog(self) -> None:
+        """Show one modal conflict resolver without requiring the main window."""
+        if not self._quality_conflicts:
+            return
+        try:
+            if self._quality_conflict_dialog is None:
+                plugin_path = cast(str, self._application.getPluginRegistry().getPluginPath(self.getPluginId()))
+                qml_path = os.path.join(plugin_path, "qml", "EventideQualityConflictDialog.qml")
+                self._quality_conflict_dialog = self._application.createQmlComponent(
+                    qml_path, {"eventideBridge": self}
+                )
+            if self._quality_conflict_dialog is not None:
+                self._quality_conflict_dialog.show()
+                try:
+                    self._quality_conflict_dialog.requestActivate()
+                except Exception:
+                    pass
+        except Exception:
+            Logger.logException("e", "Eventide could not show quality conflict dialog")
+
+    def _current_quality_conflict(self) -> Optional[Dict[str, Any]]:
+        self._quality_conflict_order = [
+            quality_id for quality_id in self._quality_conflict_order
+            if quality_id in self._quality_conflicts
+        ]
+        if not self._quality_conflict_order:
+            self._quality_conflict_index = 0
+            return None
+        self._quality_conflict_index %= len(self._quality_conflict_order)
+        quality_id = self._quality_conflict_order[self._quality_conflict_index]
+        return self._quality_conflicts.get(quality_id)
+
+    def _unique_quality_copy_name(self, root: str, quality_definition: str, requested_name: str) -> str:
+        base = str(requested_name or "").strip() or "Conflict copy"
+        registry = CuraContainerRegistry.getInstance()
+        remote_names = set()
+        quality_dir = os.path.join(root, "quality")
+        try:
+            for filename in os.listdir(quality_dir):
+                if not filename.lower().endswith(".json"):
+                    continue
+                try:
+                    record = self._read_json(os.path.join(quality_dir, filename))
+                    remote_names.add(str(record.get("name", "") or "").strip().lower())
+                except Exception:
+                    continue
+        except OSError:
+            pass
+
+        candidate = base
+        suffix = 2
+        while True:
+            try:
+                local_matches = registry.findInstanceContainersMetadata(
+                    type="quality_changes",
+                    definition=quality_definition,
+                    name=candidate,
+                )
+            except Exception:
+                local_matches = []
+            if not local_matches and candidate.lower() not in remote_names:
+                return candidate
+            candidate = "{} ({})".format(base, suffix)
+            suffix += 1
+
+    def _create_quality_copy_from_payload(
+        self,
+        root: str,
+        source_record: Dict[str, Any],
+        local_payload: Dict[str, Any],
+        requested_name: str,
+    ) -> Tuple[str, str]:
+        """Preserve the local side of a conflict as a new shared Cura profile."""
+        printer_id = str(source_record.get("printer_id", "") or local_payload.get("printer_id", "") or "").strip()
+        if not printer_id:
+            raise ValueError("conflicting quality profile has no shared printer identity")
+        printer_path = os.path.join(root, "printers", printer_id + ".json")
+        if not os.path.isfile(printer_path):
+            raise ValueError("shared printer record is missing")
+        printer_record = self._read_json(printer_path)
+        target_machine = self._find_local_machine_for_record(printer_record)
+        if target_machine is None:
+            raise ValueError("the shared printer is not installed in this Cura")
+
+        quality_definition = str(
+            local_payload.get("quality_definition", "")
+            or source_record.get("quality_definition", "")
+            or "fdmprinter"
+        ).strip()
+        registry = CuraContainerRegistry.getInstance()
+        if not registry.findDefinitionContainers(id=quality_definition):
+            raise ValueError("quality definition {} is not installed".format(quality_definition))
+
+        copy_name = self._unique_quality_copy_name(root, quality_definition, requested_name)
+        copy_id = self._stable_id("quality", printer_id, uuid.uuid4().hex)
+        copy_payload = {
+            "printer_id": printer_id,
+            "name": copy_name,
+            "quality_type": str(local_payload.get("quality_type", "not_supported") or "not_supported"),
+            "intent_category": str(local_payload.get("intent_category", "default") or "default"),
+            "quality_definition": quality_definition,
+            "global_values": dict(local_payload.get("global_values", {}) or {}),
+            "extruders": [
+                {"position": int(item.get("position", 0)), "values": dict(item.get("values", {}) or {})}
+                for item in list(local_payload.get("extruders", []) or [])
+                if isinstance(item, dict)
+            ],
+        }
+        copy_payload["content_hash"] = self._quality_hash(copy_payload)
+        now = self._utc_now()
+        copy_record = {
+            "schema": self.QUALITY_SCHEMA,
+            "format": self.RECORD_FORMAT,
+            "id": copy_id,
+            "revision": 1,
+            "created_utc": now,
+            "updated_utc": now,
+            "updated_by": self._writer_info(),
+            **copy_payload,
+        }
+
+        # Write the copy to the shared library first. Even if Cura container
+        # creation subsequently fails, the user's local edit is preserved in
+        # the NAS and will be installable on the next synchronization pass.
+        self._atomic_write_json(os.path.join(root, "quality", copy_id + ".json"), copy_record)
+        self._quality_sync_state[copy_id] = {
+            "revision": 1,
+            "content_hash": str(copy_payload["content_hash"]),
+            "printer_id": printer_id,
+        }
+
+        machine_definition_id = str(target_machine.definition.getId() or "")
+        self._create_quality_container(
+            machine_definition_id,
+            copy_record,
+            quality_definition,
+            None,
+            dict(copy_payload.get("global_values", {}) or {}),
+        )
+        target_extruders: Dict[int, Any] = {}
+        for extruder in list(getattr(target_machine, "extruderList", []) or []):
+            try:
+                target_extruders[int(extruder.getMetaDataEntry("position") or 0)] = extruder
+            except Exception:
+                continue
+        for item in list(copy_payload.get("extruders", []) or []):
+            position = int(item.get("position", 0) or 0)
+            target = target_extruders.get(position)
+            if target is None:
+                continue
+            self._create_quality_container(
+                target.getId(),
+                copy_record,
+                quality_definition,
+                position,
+                dict(item.get("values", {}) or {}),
+            )
+        return copy_id, copy_name
 
     def _quality_group_payload(self, printer_record_id: str, group: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
         registry = CuraContainerRegistry.getInstance()
@@ -2084,6 +2385,7 @@ class EventideSharedProfiles(QObject, Extension):
                 return stats
 
             groups = ContainerTree.getInstance().getCurrentQualityChangesGroups()
+            present_quality_ids = set()
             touched = False
             state_changed = False
             for group in groups:
@@ -2093,29 +2395,67 @@ class EventideSharedProfiles(QObject, Extension):
                         stats["skipped"] += 1
                         continue
                     quality_id, payload = captured
+                    present_quality_ids.add(quality_id)
                     path = os.path.join(root, "quality", quality_id + ".json")
                     local_hash = str(payload["content_hash"])
                     state = dict(self._quality_sync_state.get(quality_id, {}) or {})
 
                     if os.path.isfile(path):
                         record = self._read_json(path)
-                        if record.get("schema") != "eventide.shared_profiles.quality" or record.get("id") != quality_id:
+                        if record.get("id") != quality_id:
+                            raise ValueError("quality record identity mismatch")
+                        if record.get("schema") == self.QUALITY_TOMBSTONE_SCHEMA:
+                            deletion = self._quality_tombstone_deletion(record)
+                            state = dict(self._quality_sync_state.get(quality_id, {}) or {})
+                            seen_hash = str(state.get("content_hash", "") or "")
+                            deleted_hash = str(deletion.get("deleted_content_hash", "") or "")
+                            # A stale/baseline copy must not resurrect a tombstoned profile.
+                            if local_hash == deleted_hash or (seen_hash and local_hash == seen_hash):
+                                stats["skipped"] += 1
+                                continue
+                            self._register_quality_deletion_conflict(quality_id, record, payload)
+                            stats["conflicts"] += 1
+                            continue
+                        if record.get("schema") != self.QUALITY_SCHEMA:
                             raise ValueError("quality record identity mismatch")
                         remote_hash = str(record.get("content_hash", "") or "")
                         remote_revision = int(record.get("revision", 0) or 0)
+                        resolution = self._quality_resolution(record)
+                        resolution_id = str(resolution.get("id", "") or "")
+                        seen_resolution_id = str(state.get("resolution_id", "") or "")
                         if remote_hash == local_hash:
+                            self._clear_quality_conflict(quality_id)
                             stats["current"] += 1
-                            self._quality_sync_state[quality_id] = {
+                            next_state = {
                                 "revision": remote_revision,
                                 "content_hash": local_hash,
                                 "printer_id": printer_record_id,
                             }
+                            if resolution_id:
+                                next_state["resolution_id"] = resolution_id
+                            self._quality_sync_state[quality_id] = next_state
                             state_changed = True
                             continue
 
                         seen_revision = int(state.get("revision", 0) or 0)
                         seen_hash = str(state.get("content_hash", "") or "")
                         remote_writer = str(record.get("updated_by", {}).get("client_id", "") or "")
+
+                        # A human explicitly chose Keep This PC on another client.
+                        # Do not let this client's old losing copy immediately
+                        # republish over that decision before the receive pass can
+                        # apply the winner. Only the known losing/baseline state is
+                        # auto-preempted; a genuinely new local edit remains a
+                        # conflict and is never silently discarded.
+                        if resolution_id and resolution_id != seen_resolution_id and remote_writer != self._client_id:
+                            losing_hashes = set(resolution.get("losing_hashes", []) or [])
+                            if local_hash in losing_hashes or (seen_hash and local_hash == seen_hash):
+                                stats["skipped"] += 1
+                                continue
+                            self._register_quality_conflict(quality_id, record, payload)
+                            stats["conflicts"] += 1
+                            continue
+
                         # Remote moved after our last synchronized revision. If
                         # local stayed unchanged, receive the remote version on
                         # this poll instead of writing stale data back. If both
@@ -2125,9 +2465,11 @@ class EventideSharedProfiles(QObject, Extension):
                                 if local_hash == seen_hash:
                                     stats["skipped"] += 1
                                     continue
+                                self._register_quality_conflict(quality_id, record, payload)
                                 stats["conflicts"] += 1
                                 continue
                             if not seen_revision and remote_writer:
+                                self._register_quality_conflict(quality_id, record, payload)
                                 stats["conflicts"] += 1
                                 continue
                         revision = remote_revision + 1
@@ -2138,7 +2480,7 @@ class EventideSharedProfiles(QObject, Extension):
 
                     now = self._utc_now()
                     record = {
-                        "schema": "eventide.shared_profiles.quality",
+                        "schema": self.QUALITY_SCHEMA,
                         "format": self.RECORD_FORMAT,
                         "id": quality_id,
                         "revision": revision,
@@ -2148,6 +2490,7 @@ class EventideSharedProfiles(QObject, Extension):
                         **payload,
                     }
                     self._atomic_write_json(path, record)
+                    self._clear_quality_conflict(quality_id)
                     self._quality_sync_state[quality_id] = {
                         "revision": revision,
                         "content_hash": local_hash,
@@ -2160,14 +2503,30 @@ class EventideSharedProfiles(QObject, Extension):
                     stats["failed"] += 1
                     Logger.logException("e", "Eventide could not publish a local quality profile")
 
+            deletion_stats = self._publish_local_quality_deletions(
+                root, printer_record_id, present_quality_ids
+            )
+            if deletion_stats.get("changed", 0):
+                touched = True
+                state_changed = True
+                stats["changed"] += deletion_stats.get("changed", 0)
+                stats["deleted"] = stats.get("deleted", 0) + deletion_stats.get("deleted", 0)
+            if deletion_stats.get("conflicts", 0):
+                stats["conflicts"] += deletion_stats.get("conflicts", 0)
+
             if touched:
                 self._touch_manifest(root)
-            if state_changed:
+            if state_changed or deletion_stats.get("current", 0):
                 self._save_config()
             if stats["conflicts"]:
                 self._last_quality_sync_summary = "QUALITY CONFLICT: {} profile(s) changed both locally and in the shared library.".format(stats["conflicts"])
             elif stats["changed"]:
-                self._last_quality_sync_summary = "Live quality sync published {} profile change(s).".format(stats["changed"])
+                if stats.get("deleted", 0):
+                    self._last_quality_sync_summary = "Live quality sync published {} change(s), including {} deletion tombstone(s).".format(
+                        stats["changed"], stats.get("deleted", 0)
+                    )
+                else:
+                    self._last_quality_sync_summary = "Live quality sync published {} profile change(s).".format(stats["changed"])
             elif groups:
                 self._last_quality_sync_summary = "Live quality sync: {} local custom profile(s) current.".format(len(groups))
         except Exception as error:
@@ -2198,6 +2557,271 @@ class EventideSharedProfiles(QObject, Extension):
                 except Exception:
                     continue
         return global_container, extruders
+
+    def _register_quality_deletion_conflict(self, quality_id: str, tombstone: Dict[str, Any], local_payload: Dict[str, Any]) -> None:
+        """Protect a local edit when a remote deletion arrives."""
+        quality_id = str(quality_id or "").strip()
+        if not quality_id:
+            return
+        remote_writer = tombstone.get("updated_by", {}) if isinstance(tombstone.get("updated_by", {}), dict) else {}
+        deletion = tombstone.get("deletion", {}) if isinstance(tombstone.get("deletion", {}), dict) else {}
+        entry = {
+            "kind": "deletion",
+            "quality_id": quality_id,
+            "name": str(local_payload.get("name", "") or tombstone.get("name", "") or "Shared Profile"),
+            "printer_id": str(tombstone.get("printer_id", "") or local_payload.get("printer_id", "") or ""),
+            "remote_revision": int(tombstone.get("revision", 0) or 0),
+            "remote_hostname": str(remote_writer.get("hostname", "") or "another computer"),
+            "remote_client_id": str(remote_writer.get("client_id", "") or ""),
+            "remote_hash": str(deletion.get("deleted_content_hash", "") or ""),
+            "local_hash": str(local_payload.get("content_hash", "") or ""),
+            "deletion_id": str(deletion.get("id", "") or ""),
+        }
+        self._quality_conflicts[quality_id] = entry
+        if quality_id not in self._quality_conflict_order:
+            self._quality_conflict_order.append(quality_id)
+        if self._quality_conflict_index >= len(self._quality_conflict_order):
+            self._quality_conflict_index = max(0, len(self._quality_conflict_order) - 1)
+        popup_token = "deletion:{}:{}:{}:{}".format(
+            quality_id,
+            entry["remote_revision"],
+            entry["remote_hash"],
+            entry["local_hash"],
+        )
+        if popup_token != self._last_quality_conflict_popup_token:
+            self._last_quality_conflict_popup_token = popup_token
+            QTimer.singleShot(0, self._show_quality_conflict_dialog)
+
+    def _register_local_delete_remote_edit_conflict(self, quality_id: str, record: Dict[str, Any]) -> None:
+        """Protect a newer shared edit when this PC deleted its older local copy."""
+        remote_writer = record.get("updated_by", {}) if isinstance(record.get("updated_by", {}), dict) else {}
+        entry = {
+            "kind": "local_delete_remote_edit",
+            "quality_id": quality_id,
+            "name": str(record.get("name", "") or "Shared Profile"),
+            "printer_id": str(record.get("printer_id", "") or ""),
+            "remote_revision": int(record.get("revision", 0) or 0),
+            "remote_hostname": str(remote_writer.get("hostname", "") or "another computer"),
+            "remote_client_id": str(remote_writer.get("client_id", "") or ""),
+            "remote_hash": str(record.get("content_hash", "") or ""),
+            "local_hash": "",
+        }
+        self._quality_conflicts[quality_id] = entry
+        if quality_id not in self._quality_conflict_order:
+            self._quality_conflict_order.append(quality_id)
+        popup_token = "local-delete:{}:{}:{}".format(
+            quality_id, entry["remote_revision"], entry["remote_hash"]
+        )
+        if popup_token != self._last_quality_conflict_popup_token:
+            self._last_quality_conflict_popup_token = popup_token
+            QTimer.singleShot(0, self._show_quality_conflict_dialog)
+
+    @staticmethod
+    def _quality_tombstone_deletion(record: Dict[str, Any]) -> Dict[str, Any]:
+        deletion = record.get("deletion", {})
+        return dict(deletion) if isinstance(deletion, dict) else {}
+
+    def _make_quality_tombstone(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        now = self._utc_now()
+        remote_revision = int(record.get("revision", 0) or 0)
+        deletion_id = str(uuid.uuid4())
+        return {
+            "schema": self.QUALITY_TOMBSTONE_SCHEMA,
+            "format": self.RECORD_FORMAT,
+            "id": str(record.get("id", "") or ""),
+            "revision": remote_revision + 1,
+            "created_utc": record.get("created_utc", now),
+            "updated_utc": now,
+            "updated_by": self._writer_info(),
+            "printer_id": str(record.get("printer_id", "") or ""),
+            "name": str(record.get("name", "") or "Shared Profile"),
+            "quality_definition": str(record.get("quality_definition", "") or ""),
+            "deleted": True,
+            "deletion": {
+                "id": deletion_id,
+                "deleted_utc": now,
+                "deleted_by": self._writer_info(),
+                "deleted_from_revision": remote_revision,
+                "deleted_content_hash": str(record.get("content_hash", "") or ""),
+            },
+        }
+
+    def _quality_is_active(self, quality_id: str) -> bool:
+        global_container, extruders = self._quality_local_containers(quality_id)
+        ids = set()
+        if global_container is not None:
+            ids.add(str(global_container.getId() or ""))
+        ids.update(str(container.getId() or "") for container in extruders.values())
+        if not ids:
+            return False
+        stack = self._application.getGlobalContainerStack()
+        if stack is None:
+            return False
+        try:
+            if str(stack.qualityChanges.getId() or "") in ids:
+                return True
+        except Exception:
+            pass
+        for extruder in list(getattr(stack, "extruderList", []) or []):
+            try:
+                if str(extruder.qualityChanges.getId() or "") in ids:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _deactivate_quality_if_active(self, quality_id: str) -> None:
+        if not self._quality_is_active(quality_id):
+            return
+        manager = self._application.getMachineManager()
+        try:
+            # Keep Cura's current base quality, but detach the custom
+            # quality_changes containers before removing them from the registry.
+            manager._setQualityGroup(manager.activeQualityGroup(), empty_quality_changes=True)
+            return
+        except Exception:
+            Logger.logException("w", "Eventide could not detach active quality through MachineManager")
+        # Conservative fallback for Cura variants where the private helper moves.
+        try:
+            from cura.Settings.cura_empty_instance_containers import empty_quality_changes_container
+            stack = self._application.getGlobalContainerStack()
+            if stack is not None:
+                stack.qualityChanges = empty_quality_changes_container
+                for extruder in list(getattr(stack, "extruderList", []) or []):
+                    extruder.qualityChanges = empty_quality_changes_container
+                manager.activeQualityChanged.emit()
+                manager.activeQualityChangesGroupChanged.emit()
+                manager.activeQualityGroupChanged.emit()
+        except Exception:
+            Logger.logException("e", "Eventide could not safely detach active quality profile")
+            raise RuntimeError("could not detach the active custom quality before deletion")
+
+    def _remove_quality_containers(self, quality_id: str) -> int:
+        self._deactivate_quality_if_active(quality_id)
+        registry = CuraContainerRegistry.getInstance()
+        global_container, extruders = self._quality_local_containers(quality_id)
+        containers = list(extruders.values())
+        if global_container is not None:
+            containers.append(global_container)
+        removed = 0
+        for container in containers:
+            container_id = str(container.getId() or "").strip()
+            if not container_id:
+                continue
+            registry.removeContainer(container_id)
+            removed += 1
+        try:
+            manager = self._application.getMachineManager()
+            manager.activeQualityChanged.emit()
+            manager.activeQualityChangesGroupChanged.emit()
+            manager.activeQualityGroupChanged.emit()
+        except Exception:
+            pass
+        return removed
+
+    def _publish_local_quality_deletions(self, root: str, printer_id: str, present_quality_ids: set) -> Dict[str, int]:
+        """Turn confirmed local removal of an Eventide-managed quality into tombstones."""
+        stats = {"changed": 0, "deleted": 0, "conflicts": 0, "current": 0}
+        for quality_id, raw_state in list(self._quality_sync_state.items()):
+            state = dict(raw_state or {}) if isinstance(raw_state, dict) else {}
+            if str(state.get("printer_id", "") or "") != printer_id:
+                continue
+            if bool(state.get("deleted", False)) or quality_id in present_quality_ids:
+                continue
+            # Do not infer deletion from ContainerTree filtering. Only publish a
+            # tombstone once the stamped containers are actually gone from the registry.
+            global_container, extruders = self._quality_local_containers(quality_id)
+            if global_container is not None or extruders:
+                continue
+            path = os.path.join(root, "quality", quality_id + ".json")
+            if not os.path.isfile(path):
+                continue
+            record = self._read_json(path)
+            schema = str(record.get("schema", "") or "")
+            if schema == self.QUALITY_TOMBSTONE_SCHEMA:
+                deletion = self._quality_tombstone_deletion(record)
+                self._quality_sync_state[quality_id] = {
+                    "revision": int(record.get("revision", 0) or 0),
+                    "content_hash": str(deletion.get("deleted_content_hash", "") or state.get("content_hash", "") or ""),
+                    "printer_id": printer_id,
+                    "deleted": True,
+                    "deletion_id": str(deletion.get("id", "") or ""),
+                }
+                stats["current"] += 1
+                continue
+            if schema != self.QUALITY_SCHEMA:
+                continue
+
+            remote_revision = int(record.get("revision", 0) or 0)
+            remote_hash = str(record.get("content_hash", "") or "")
+            seen_revision = int(state.get("revision", 0) or 0)
+            seen_hash = str(state.get("content_hash", "") or "")
+            remote_writer = str(record.get("updated_by", {}).get("client_id", "") or "") if isinstance(record.get("updated_by", {}), dict) else ""
+            remote_moved = bool(
+                remote_writer != self._client_id
+                and (
+                    (seen_revision and remote_revision != seen_revision)
+                    or (seen_hash and remote_hash != seen_hash)
+                    or not seen_revision
+                )
+            )
+            if remote_moved:
+                self._register_local_delete_remote_edit_conflict(quality_id, record)
+                stats["conflicts"] += 1
+                continue
+
+            tombstone = self._make_quality_tombstone(record)
+            self._atomic_write_json(path, tombstone)
+            deletion = self._quality_tombstone_deletion(tombstone)
+            self._quality_sync_state[quality_id] = {
+                "revision": int(tombstone.get("revision", 0) or 0),
+                "content_hash": str(deletion.get("deleted_content_hash", "") or remote_hash),
+                "printer_id": printer_id,
+                "deleted": True,
+                "deletion_id": str(deletion.get("id", "") or ""),
+            }
+            self._clear_quality_conflict(quality_id)
+            stats["changed"] += 1
+            stats["deleted"] += 1
+        return stats
+
+    def _apply_quality_tombstone(self, root: str, record: Dict[str, Any], force: bool = False) -> str:
+        quality_id = str(record.get("id", "") or "").strip()
+        printer_id = str(record.get("printer_id", "") or "").strip()
+        if not quality_id:
+            raise ValueError("quality tombstone missing id")
+        deletion = self._quality_tombstone_deletion(record)
+        deleted_hash = str(deletion.get("deleted_content_hash", "") or "")
+        remote_revision = int(record.get("revision", 0) or 0)
+        state = dict(self._quality_sync_state.get(quality_id, {}) or {})
+        global_container, extruders = self._quality_local_containers(quality_id)
+
+        if global_container is not None:
+            local_payload = self._quality_payload_from_local_containers(printer_id, global_container, extruders)
+            local_hash = str(local_payload.get("content_hash", "") or "")
+            seen_hash = str(state.get("content_hash", "") or "")
+            safe_baseline = bool(
+                (deleted_hash and local_hash == deleted_hash)
+                or (seen_hash and local_hash == seen_hash and not bool(state.get("deleted", False)))
+            )
+            if not force and not safe_baseline:
+                self._register_quality_deletion_conflict(quality_id, record, local_payload)
+                return "deletion-conflict"
+            self._remove_quality_containers(quality_id)
+            outcome = "deleted"
+        else:
+            outcome = "deleted-existing"
+
+        self._clear_quality_conflict(quality_id)
+        self._quality_sync_state[quality_id] = {
+            "revision": remote_revision,
+            "content_hash": deleted_hash or str(state.get("content_hash", "") or ""),
+            "printer_id": printer_id or str(state.get("printer_id", "") or ""),
+            "deleted": True,
+            "deletion_id": str(deletion.get("id", "") or ""),
+        }
+        self._save_config()
+        return outcome
 
     def _quality_payload_from_local_containers(self, printer_id: str, global_container: Any, extruders: Dict[int, Any]) -> Dict[str, Any]:
         payload = {
@@ -2237,7 +2861,7 @@ class EventideSharedProfiles(QObject, Extension):
         registry.addContainer(container)
         return container
 
-    def _apply_quality_record(self, root: str, record: Dict[str, Any]) -> str:
+    def _apply_quality_record(self, root: str, record: Dict[str, Any], force: bool = False) -> str:
         quality_id = str(record.get("id", "") or "").strip()
         printer_id = str(record.get("printer_id", "") or "").strip()
         if not quality_id or not printer_id:
@@ -2274,24 +2898,41 @@ class EventideSharedProfiles(QObject, Extension):
         remote_hash = str(record.get("content_hash", "") or "")
         remote_revision = int(record.get("revision", 0) or 0)
         state = dict(self._quality_sync_state.get(quality_id, {}) or {})
+        resolution = self._quality_resolution(record)
+        resolution_id = str(resolution.get("id", "") or "")
+        seen_resolution_id = str(state.get("resolution_id", "") or "")
 
         if global_container is not None:
             local_payload = self._quality_payload_from_local_containers(printer_id, global_container, extruder_containers)
             local_hash = str(local_payload.get("content_hash", "") or "")
             if local_hash == remote_hash:
-                self._quality_sync_state[quality_id] = {"revision": remote_revision, "content_hash": remote_hash, "printer_id": printer_id}
+                self._clear_quality_conflict(quality_id)
+                next_state = {"revision": remote_revision, "content_hash": remote_hash, "printer_id": printer_id}
+                if resolution_id:
+                    next_state["resolution_id"] = resolution_id
+                self._quality_sync_state[quality_id] = next_state
                 self._save_config()
                 return "existing"
             seen_hash = str(state.get("content_hash", "") or "")
             seen_revision = int(state.get("revision", 0) or 0)
-            if not seen_revision:
-                return "conflict"
-            if local_hash != seen_hash:
-                if remote_revision != seen_revision:
+            authoritative_resolution = False
+            if resolution_id and resolution_id != seen_resolution_id:
+                losing_hashes = set(resolution.get("losing_hashes", []) or [])
+                authoritative_resolution = (
+                    local_hash in losing_hashes
+                    or bool(seen_hash and local_hash == seen_hash)
+                )
+            if not force and not authoritative_resolution:
+                if not seen_revision:
+                    self._register_quality_conflict(quality_id, record, local_payload)
                     return "conflict"
-                # Local moved while shared did not. Never overwrite it from a
-                # manual/automatic receive pass; the publisher will send it.
-                return "local-newer"
+                if local_hash != seen_hash:
+                    if remote_revision != seen_revision:
+                        self._register_quality_conflict(quality_id, record, local_payload)
+                        return "conflict"
+                    # Local moved while shared did not. Never overwrite it from a
+                    # manual/automatic receive pass; the publisher will send it.
+                    return "local-newer"
 
         name = str(record.get("name", "") or "Shared Profile")
         quality_type = str(record.get("quality_type", "not_supported") or "not_supported")
@@ -2338,7 +2979,11 @@ class EventideSharedProfiles(QObject, Extension):
                 container.setMetaDataEntry("eventide_printer_id", printer_id)
                 self._apply_instance_values(container, values)
 
-        self._quality_sync_state[quality_id] = {"revision": remote_revision, "content_hash": remote_hash, "printer_id": printer_id}
+        self._clear_quality_conflict(quality_id)
+        next_state = {"revision": remote_revision, "content_hash": remote_hash, "printer_id": printer_id}
+        if resolution_id:
+            next_state["resolution_id"] = resolution_id
+        self._quality_sync_state[quality_id] = next_state
         self._save_config()
         try:
             manager = self._application.getMachineManager()
@@ -2349,42 +2994,282 @@ class EventideSharedProfiles(QObject, Extension):
         return "installed" if created else "updated"
 
     def _sync_quality_records(self, root: str) -> Tuple[Dict[str, int], List[str]]:
-        stats = {"installed": 0, "updated": 0, "existing": 0, "local-newer": 0, "conflict": 0, "name-conflict": 0, "missing-machine": 0, "missing-printer-record": 0, "missing-quality-definition": 0, "failed": 0}
+        stats = {
+            "installed": 0, "updated": 0, "existing": 0, "local-newer": 0,
+            "deleted": 0, "deleted-existing": 0, "deletion-conflict": 0,
+            "conflict": 0, "name-conflict": 0, "missing-machine": 0,
+            "missing-printer-record": 0, "missing-quality-definition": 0, "failed": 0
+        }
         failures: List[str] = []
         quality_dir = os.path.join(root, "quality")
         try:
             names = sorted(name for name in os.listdir(quality_dir) if name.lower().endswith(".json"))
         except OSError:
             names = []
+        # Read first, then apply tombstones before live records. A deleted name may
+        # legitimately be reused by a newly-created profile with a new Eventide ID;
+        # removing the old identity first avoids a transient false name conflict.
+        queued: List[Tuple[str, Dict[str, Any]]] = []
         for name in names:
             try:
                 record = self._read_json(os.path.join(quality_dir, name))
-                if record.get("schema") != "eventide.shared_profiles.quality":
-                    continue
-                outcome = self._apply_quality_record(root, record)
+                schema = str(record.get("schema", "") or "")
+                if schema in (self.QUALITY_SCHEMA, self.QUALITY_TOMBSTONE_SCHEMA):
+                    queued.append((name, record))
+            except Exception as error:
+                stats["failed"] += 1
+                failures.append("{}: {}".format(name, error))
+                Logger.logException("e", "Eventide quality sync could not read %s", name)
+
+        queued.sort(
+            key=lambda item: (
+                0 if str(item[1].get("schema", "") or "") == self.QUALITY_TOMBSTONE_SCHEMA else 1,
+                item[0],
+            )
+        )
+        for name, record in queued:
+            try:
+                schema = str(record.get("schema", "") or "")
+                if schema == self.QUALITY_TOMBSTONE_SCHEMA:
+                    outcome = self._apply_quality_tombstone(root, record)
+                else:
+                    outcome = self._apply_quality_record(root, record)
                 stats[outcome] = stats.get(outcome, 0) + 1
                 if outcome == "conflict":
                     failures.append("{}: local and shared profile both changed".format(name))
+                elif outcome == "deletion-conflict":
+                    failures.append("{}: shared profile was deleted while this PC has an independent local edit".format(name))
                 elif outcome == "name-conflict":
                     failures.append("{}: Cura already has a different custom profile with this name".format(name))
             except Exception as error:
                 stats["failed"] += 1
                 failures.append("{}: {}".format(name, error))
                 Logger.logException("e", "Eventide quality sync failed for %s", name)
-        if stats["conflict"] or stats["name-conflict"]:
-            self._last_quality_sync_summary = "QUALITY CONFLICT: {} edit conflict(s), {} name conflict(s).".format(stats["conflict"], stats["name-conflict"])
-        elif stats["installed"] or stats["updated"]:
-            self._last_quality_sync_summary = "Live quality sync: {} installed, {} updated.".format(stats["installed"], stats["updated"])
+        if stats["conflict"] or stats["deletion-conflict"] or stats["name-conflict"]:
+            self._last_quality_sync_summary = (
+                "QUALITY CONFLICT: {} edit conflict(s), {} deletion conflict(s), {} name conflict(s)."
+            ).format(stats["conflict"], stats["deletion-conflict"], stats["name-conflict"])
+        elif stats["installed"] or stats["updated"] or stats["deleted"]:
+            self._last_quality_sync_summary = "Live quality sync: {} installed, {} updated, {} deleted.".format(
+                stats["installed"], stats["updated"], stats["deleted"]
+            )
         elif sum(stats.values()):
             self._last_quality_sync_summary = "Live quality sync: shared profiles are current."
         return stats, failures
+
+    @pyqtSlot(str, str, str, result=str)
+    def resolveQualityConflict(self, requested_path: str, strategy: str, copy_name: str) -> str:
+        """Resolve edit and deletion conflicts without silent data loss."""
+        try:
+            root = self._save_library_path_from_ui(requested_path)
+            self._require_initialized_library(root)
+            conflict = self._current_quality_conflict()
+            if conflict is None:
+                raise ValueError("there is no quality-profile conflict to resolve")
+            quality_id = str(conflict.get("quality_id", "") or "").strip()
+            path = os.path.join(root, "quality", quality_id + ".json")
+            if not os.path.isfile(path):
+                raise ValueError("the conflicting shared profile no longer exists")
+            record = self._read_json(path)
+            conflict_kind = str(conflict.get("kind", "edit") or "edit")
+            action = str(strategy or "").strip().lower()
+
+            if conflict_kind == "deletion":
+                if record.get("schema") != self.QUALITY_TOMBSTONE_SCHEMA:
+                    raise ValueError("the shared deletion was superseded; synchronize again")
+                printer_id = str(record.get("printer_id", "") or "").strip()
+                global_container, extruder_containers = self._quality_local_containers(quality_id)
+                if global_container is None:
+                    outcome = self._apply_quality_tombstone(root, record, force=True)
+                    self._clear_quality_conflict(quality_id)
+                    result = "CONFLICT RESOLVED: accepted deletion of '{}'.".format(record.get("name", "Shared Profile"))
+                else:
+                    local_payload = self._quality_payload_from_local_containers(
+                        printer_id, global_container, extruder_containers
+                    )
+                    if action == "accept_deletion":
+                        outcome = self._apply_quality_tombstone(root, record, force=True)
+                        if outcome not in ("deleted", "deleted-existing"):
+                            raise RuntimeError("shared deletion could not be applied ({})".format(outcome))
+                        result = "CONFLICT RESOLVED: accepted deletion of '{}'.".format(local_payload.get("name", "Shared Profile"))
+                    elif action == "keep_as_new":
+                        requested = str(copy_name or "").strip() or "{} (Preserved - {})".format(
+                            local_payload.get("name", "Shared Profile"), socket.gethostname()
+                        )
+                        _copy_id, final_name = self._create_quality_copy_from_payload(
+                            root, record, local_payload, requested
+                        )
+                        outcome = self._apply_quality_tombstone(root, record, force=True)
+                        if outcome not in ("deleted", "deleted-existing"):
+                            raise RuntimeError("shared deletion could not be applied ({})".format(outcome))
+                        self._touch_manifest(root)
+                        result = "CONFLICT RESOLVED: preserved this PC's edit as '{}' and accepted deletion of the original.".format(final_name)
+                    elif action == "restore_profile":
+                        now = self._utc_now()
+                        restored = {
+                            "schema": self.QUALITY_SCHEMA,
+                            "format": self.RECORD_FORMAT,
+                            "id": quality_id,
+                            "revision": int(record.get("revision", 0) or 0) + 1,
+                            "created_utc": record.get("created_utc", now),
+                            "updated_utc": now,
+                            "updated_by": self._writer_info(),
+                            **local_payload,
+                            "restored_from_deletion": {
+                                "deletion_id": str(self._quality_tombstone_deletion(record).get("id", "") or ""),
+                                "restored_utc": now,
+                                "restored_by": self._writer_info(),
+                            },
+                        }
+                        self._atomic_write_json(path, restored)
+                        self._quality_sync_state[quality_id] = {
+                            "revision": int(restored["revision"]),
+                            "content_hash": str(local_payload.get("content_hash", "") or ""),
+                            "printer_id": printer_id,
+                        }
+                        self._touch_manifest(root)
+                        self._save_config()
+                        self._clear_quality_conflict(quality_id)
+                        result = "CONFLICT RESOLVED: restored '{}' as the shared profile.".format(local_payload.get("name", "Shared Profile"))
+                    else:
+                        raise ValueError("unknown deletion-conflict action")
+
+            elif conflict_kind == "local_delete_remote_edit":
+                if record.get("schema") != self.QUALITY_SCHEMA:
+                    raise ValueError("the shared edit was superseded; synchronize again")
+                if action == "accept_deletion":
+                    tombstone = self._make_quality_tombstone(record)
+                    self._atomic_write_json(path, tombstone)
+                    deletion = self._quality_tombstone_deletion(tombstone)
+                    self._quality_sync_state[quality_id] = {
+                        "revision": int(tombstone.get("revision", 0) or 0),
+                        "content_hash": str(deletion.get("deleted_content_hash", "") or ""),
+                        "printer_id": str(tombstone.get("printer_id", "") or ""),
+                        "deleted": True,
+                        "deletion_id": str(deletion.get("id", "") or ""),
+                    }
+                    self._touch_manifest(root)
+                    self._save_config()
+                    self._clear_quality_conflict(quality_id)
+                    result = "CONFLICT RESOLVED: deleted '{}' after reviewing the newer shared edit.".format(record.get("name", "Shared Profile"))
+                elif action == "restore_profile":
+                    outcome = self._apply_quality_record(root, record, force=True)
+                    if outcome not in ("installed", "updated", "existing"):
+                        raise RuntimeError("shared profile could not be restored ({})".format(outcome))
+                    self._clear_quality_conflict(quality_id)
+                    result = "CONFLICT RESOLVED: restored the newer shared '{}' on this PC.".format(record.get("name", "Shared Profile"))
+                else:
+                    raise ValueError("choose Accept Deletion or Restore Profile for this conflict")
+
+            else:
+                if record.get("schema") != self.QUALITY_SCHEMA:
+                    raise ValueError("the shared profile changed type; synchronize again")
+                printer_id = str(record.get("printer_id", "") or "").strip()
+                global_container, extruder_containers = self._quality_local_containers(quality_id)
+                if global_container is None:
+                    raise ValueError("the conflicting local Cura profile is no longer installed")
+                local_payload = self._quality_payload_from_local_containers(
+                    printer_id, global_container, extruder_containers
+                )
+
+                if action == "keep_local":
+                    remote_revision = int(record.get("revision", 0) or 0)
+                    now = self._utc_now()
+                    resolution_id = str(uuid.uuid4())
+                    winning_hash = str(local_payload.get("content_hash", "") or "")
+                    losing_hash = str(record.get("content_hash", "") or "")
+                    winning = {
+                        "schema": self.QUALITY_SCHEMA,
+                        "format": self.RECORD_FORMAT,
+                        "id": quality_id,
+                        "revision": remote_revision + 1,
+                        "created_utc": record.get("created_utc", now),
+                        "updated_utc": now,
+                        "updated_by": self._writer_info(),
+                        **local_payload,
+                        "resolution": {
+                            "id": resolution_id,
+                            "strategy": "keep_local",
+                            "resolved_utc": now,
+                            "resolved_by": self._writer_info(),
+                            "supersedes_revision": remote_revision,
+                            "winning_hash": winning_hash,
+                            "losing_hashes": [losing_hash] if losing_hash and losing_hash != winning_hash else [],
+                        },
+                    }
+                    self._atomic_write_json(path, winning)
+                    self._quality_sync_state[quality_id] = {
+                        "revision": remote_revision + 1,
+                        "content_hash": winning_hash,
+                        "printer_id": printer_id,
+                        "resolution_id": resolution_id,
+                    }
+                    self._touch_manifest(root)
+                    self._clear_quality_conflict(quality_id)
+                    self._save_config()
+                    result = "CONFLICT RESOLVED: kept this PC's '{}' as the shared version.".format(local_payload.get("name", "Shared Profile"))
+
+                elif action == "use_shared":
+                    outcome = self._apply_quality_record(root, record, force=True)
+                    if outcome not in ("installed", "updated", "existing"):
+                        raise RuntimeError("shared profile could not be applied ({})".format(outcome))
+                    self._clear_quality_conflict(quality_id)
+                    result = "CONFLICT RESOLVED: this PC now uses the shared '{}'.".format(record.get("name", "Shared Profile"))
+
+                elif action == "create_copy":
+                    requested = str(copy_name or "").strip()
+                    if not requested:
+                        requested = "{} (Conflict copy - {})".format(
+                            local_payload.get("name", "Shared Profile"), socket.gethostname()
+                        )
+                    _copy_id, final_name = self._create_quality_copy_from_payload(
+                        root, record, local_payload, requested
+                    )
+                    outcome = self._apply_quality_record(root, record, force=True)
+                    if outcome not in ("installed", "updated", "existing"):
+                        raise RuntimeError("shared original could not be restored ({})".format(outcome))
+                    self._touch_manifest(root)
+                    self._clear_quality_conflict(quality_id)
+                    self._save_config()
+                    result = "CONFLICT RESOLVED: preserved this PC's edit as '{}' and restored the shared original.".format(final_name)
+                else:
+                    raise ValueError("unknown conflict-resolution action")
+
+            self._library_content_signature = self._get_library_content_signature()
+            self._last_quality_sync_summary = result
+            remaining_conflicts = len(self._quality_conflicts)
+            if remaining_conflicts:
+                self._last_sync_summary = "SYNC: conflict resolved; {} unresolved quality conflict(s) remain.".format(remaining_conflicts)
+            else:
+                self._last_sync_summary = "SYNC: conflict resolved; no unresolved quality-profile conflicts."
+            self._last_library_event = "Quality conflict resolved at {}.".format(self._utc_now())
+            self._status = result
+        except Exception as error:
+            result = "CONFLICT RESOLUTION FAILED: {}".format(error)
+            self._status = result
+            self._last_quality_sync_summary = result
+            Logger.logException("e", "Eventide quality conflict resolution failed")
+        self.stateChanged.emit()
+        return result
+
+    @pyqtSlot()
+    def nextQualityConflict(self) -> None:
+        if self._quality_conflict_order:
+            self._quality_conflict_index = (self._quality_conflict_index + 1) % len(self._quality_conflict_order)
+            self.stateChanged.emit()
+
+    @pyqtSlot()
+    def previousQualityConflict(self) -> None:
+        if self._quality_conflict_order:
+            self._quality_conflict_index = (self._quality_conflict_index - 1) % len(self._quality_conflict_order)
+            self.stateChanged.emit()
 
     @pyqtSlot(str, result=str)
     def syncLibraryToCura(self, requested_path: str) -> str:
         """Install missing published materials and machine instances into this Cura profile."""
         material_stats = {"installed": 0, "existing": 0, "unpublished": 0, "builtin-missing": 0, "failed": 0}
         machine_stats = {"installed": 0, "existing": 0, "unpublished": 0, "missing-definition": 0, "failed": 0}
-        quality_stats = {"installed": 0, "updated": 0, "existing": 0, "local-newer": 0, "conflict": 0, "name-conflict": 0, "failed": 0}
+        quality_stats = {"installed": 0, "updated": 0, "existing": 0, "local-newer": 0, "deleted": 0, "deleted-existing": 0, "deletion-conflict": 0, "conflict": 0, "name-conflict": 0, "failed": 0}
         failures = []
         try:
             root = self._save_library_path_from_ui(requested_path)
@@ -2431,12 +3316,12 @@ class EventideSharedProfiles(QObject, Extension):
             self.refreshSelection()
             self._last_sync_summary = (
                 "SYNC: materials +{} / {} local; machines +{} / {} local; "
-                "quality +{} / {} updated / {} local; {} conflict(s); {} failure(s)."
+                "quality +{} / {} updated / {} local / {} deleted; {} conflict(s); {} failure(s)."
             ).format(
                 material_stats.get("installed", 0), material_stats.get("existing", 0),
                 machine_stats.get("installed", 0), machine_stats.get("existing", 0),
-                quality_stats.get("installed", 0), quality_stats.get("updated", 0), quality_stats.get("existing", 0),
-                quality_stats.get("conflict", 0) + quality_stats.get("name-conflict", 0), len(failures),
+                quality_stats.get("installed", 0), quality_stats.get("updated", 0), quality_stats.get("existing", 0), quality_stats.get("deleted", 0),
+                quality_stats.get("conflict", 0) + quality_stats.get("deletion-conflict", 0) + quality_stats.get("name-conflict", 0), len(failures),
             )
             if failures:
                 self._last_sync_summary += " First: {}".format(failures[0])
@@ -2462,7 +3347,7 @@ class EventideSharedProfiles(QObject, Extension):
                 "printers": "eventide.shared_profiles.printer",
                 "filaments": "eventide.shared_profiles.filament",
                 "capabilities": "eventide.shared_profiles.capability",
-                "quality": "eventide.shared_profiles.quality",
+                "quality": self.QUALITY_SCHEMA,
             }
             ids_by_folder: Dict[str, set] = {name: set() for name in expected}
             records_by_folder: Dict[str, list] = {name: [] for name in expected}
@@ -2481,7 +3366,11 @@ class EventideSharedProfiles(QObject, Extension):
                     except Exception as error:
                         errors.append("{}: invalid JSON ({})".format(name, error))
                         continue
-                    if record.get("schema") != schema:
+                    record_schema = str(record.get("schema", "") or "")
+                    allowed_schemas = {schema}
+                    if folder == "quality":
+                        allowed_schemas.add(self.QUALITY_TOMBSTONE_SCHEMA)
+                    if record_schema not in allowed_schemas:
                         errors.append("{}: schema {}".format(name, record.get("schema")))
                         continue
                     record_id = str(record.get("id", "") or "").strip()
@@ -2518,6 +3407,11 @@ class EventideSharedProfiles(QObject, Extension):
                     errors.append("{}: missing printer reference".format(name))
                 if not str(record.get("name", "") or "").strip():
                     errors.append("{}: quality profile name is blank".format(name))
+                if record.get("schema") == self.QUALITY_TOMBSTONE_SCHEMA:
+                    deletion = self._quality_tombstone_deletion(record)
+                    if not record.get("deleted") or not str(deletion.get("id", "") or ""):
+                        errors.append("{}: invalid quality tombstone".format(name))
+                    continue
                 content_hash = str(record.get("content_hash", "") or "")
                 payload = {
                     "printer_id": record.get("printer_id"),
@@ -2733,8 +3627,13 @@ class EventideSharedProfiles(QObject, Extension):
                 })
             else:
                 manifest = self._read_json(manifest_path)
+                manifest_changed = False
                 if "record_format" not in manifest:
                     manifest["record_format"] = self.RECORD_FORMAT
+                    manifest_changed = True
+                if str(manifest.get("publisher_plugin_version", "") or "") != self.PUBLISHER_PLUGIN_VERSION:
+                    manifest_changed = True
+                if manifest_changed:
                     manifest["updated_utc"] = self._utc_now()
                     manifest["updated_by"] = self._writer_info()
                     self._atomic_write_json(manifest_path, manifest)
@@ -2797,6 +3696,18 @@ class EventideSharedProfiles(QObject, Extension):
                 self._active_material_id,
                 self._active_material_name,
             )
+
+            # Pin this local Cura machine instance to the shared Eventide printer
+            # identity.  Imported machines already carry this metadata; stamping the
+            # source machine too makes identity resolution symmetric on every PC.
+            try:
+                global_stack = self._application.getGlobalContainerStack()
+                if global_stack is not None:
+                    global_stack.setMetaDataEntry("eventide_record_id", printer_record_id)
+                    self._machine_bindings[printer_record_id] = str(global_stack.getId() or "").strip()
+                    self._save_config()
+            except Exception:
+                Logger.logException("w", "Eventide could not bind source machine to shared printer identity")
 
             # Publish portable sync payloads. Built-in materials are recorded as
             # built-in identities without duplicating Cura's read-only XML. Machine
@@ -3588,6 +4499,57 @@ class EventideSharedProfiles(QObject, Extension):
     @pyqtProperty(str, notify=stateChanged)
     def lastSyncSummary(self) -> str:
         return self._last_sync_summary
+
+    @pyqtProperty(str, notify=stateChanged)
+    def pluginVersion(self) -> str:
+        return self.PLUGIN_VERSION
+
+    @pyqtProperty(int, notify=stateChanged)
+    def qualityConflictCount(self) -> int:
+        return len(self._quality_conflicts)
+
+    @pyqtProperty(str, notify=stateChanged)
+    def qualityConflictKind(self) -> str:
+        conflict = self._current_quality_conflict()
+        return str(conflict.get("kind", "edit") or "edit") if conflict else ""
+
+    @pyqtProperty(str, notify=stateChanged)
+    def qualityConflictName(self) -> str:
+        conflict = self._current_quality_conflict()
+        return str(conflict.get("name", "") or "") if conflict else ""
+
+    @pyqtProperty(str, notify=stateChanged)
+    def qualityConflictPosition(self) -> str:
+        if not self._quality_conflicts:
+            return ""
+        self._current_quality_conflict()
+        return "{} of {}".format(self._quality_conflict_index + 1, len(self._quality_conflict_order))
+
+    @pyqtProperty(str, notify=stateChanged)
+    def qualityConflictDetails(self) -> str:
+        conflict = self._current_quality_conflict()
+        if not conflict:
+            return ""
+        kind = str(conflict.get("kind", "edit") or "edit")
+        revision = int(conflict.get("remote_revision", 0) or 0)
+        host = str(conflict.get("remote_hostname", "") or "another computer")
+        if kind == "deletion":
+            return "The shared profile was deleted at revision {} by {}, but this PC has an independent edit. Accept the deletion, preserve this edit as a new profile, or deliberately restore it as the shared profile.".format(revision, host)
+        if kind == "local_delete_remote_edit":
+            return "This PC deleted the profile, but revision {} from {} contains a newer shared edit. Review the conflict before either deleting that newer edit or restoring it on this PC.".format(revision, host)
+        return "This PC and the shared library both changed this profile. Shared revision {} was last written by {}. Choose which version to keep, or preserve this PC's edit as a new profile.".format(revision, host)
+
+    @pyqtProperty(str, notify=stateChanged)
+    def qualityConflictSuggestedCopyName(self) -> str:
+        conflict = self._current_quality_conflict()
+        if not conflict:
+            return ""
+        suffix = "Preserved" if str(conflict.get("kind", "edit") or "edit") == "deletion" else "Conflict copy"
+        return "{} ({} - {})".format(
+            str(conflict.get("name", "") or "Shared Profile"),
+            suffix,
+            socket.gethostname(),
+        )
 
     @pyqtProperty(str, notify=stateChanged)
     def lastQualitySyncSummary(self) -> str:
