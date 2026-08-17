@@ -1,4 +1,4 @@
-# Eventide Shared Profiles 0.8.6 Beta Test Matrix
+# Eventide Shared Profiles 0.8.7 Beta Test Matrix
 
 No printer hardware is required for these tests.
 
@@ -102,29 +102,37 @@ After resolving a quality-profile conflict with **Keep This PC**, **Use Shared V
 6. Make a fresh unrelated edit on the second PC after it has accepted the resolution. Expected: that later edit publishes normally and is not treated as part of the old resolution.
 
 
-## Quality deletion/tombstone regression (0.8.6)
+## Legacy quality tombstone regression (0.8.6 compatibility)
 
-1. Synchronize one custom quality profile on PC1 and PC2.
-2. Delete the profile normally in Cura on PC1.
-3. Expected: the existing shared quality JSON remains in place but changes to the `eventide.shared_profiles.quality_tombstone` schema with a higher revision and a deletion ID.
-4. Expected on PC2: within live-sync polling, the matching local custom profile disappears. If it was active, Cura first falls back to a safe/base quality rather than retaining a dangling active container.
-5. Close PC2 before step 2, leave it offline for a while, then reopen it with the old local copy. Expected: PC2 honors the tombstone and does not republish the stale profile.
-6. Create a new Cura profile using the same visible name. Expected: it publishes with a new Eventide quality ID while the old tombstone remains.
+1. Use an archived/isolated 0.8.6 test library containing an `eventide.shared_profiles.quality_tombstone` record. Do not create a new deletion with 0.8.7 for this test.
+2. Open the library with 0.8.7. Expected: the legacy tombstone is accepted as deleted and the matching local Eventide-managed profile is removed safely.
+3. Expected: 0.8.7 does not rewrite another deletion into the legacy destructive tombstone schema.
 
-## Deletion conflict regression (0.8.6)
+## Deletion conflict regression (0.8.7)
 
 1. Start with the same synchronized profile on PC1 and PC2.
 2. Prevent one PC from seeing the other's change long enough to create a race: delete the profile on PC1 while independently editing it on PC2.
 3. Expected: Eventide does not silently destroy the independent edit or silently resurrect the deleted original.
-4. Test **Accept Deletion**: the edited local copy is removed and the tombstone remains authoritative.
-5. Recreate the race and test **Keep as New Profile**: the edited copy is preserved under a new Eventide identity/name, while the original remains deleted.
-6. Recreate the race and test **Restore Profile**: the edited version becomes a new live revision of the original shared Eventide identity, superseding the tombstone.
+4. Test **Accept Deletion**: the edited local copy is removed and the original shared record remains intact with `is_deleted: true`.
+5. Recreate the race and test **Keep as New Profile**: the edited copy is preserved under a new Eventide identity/name, while the original remains soft-deleted.
+6. Recreate the race and test **Restore Profile**: the edited version becomes a new active revision of the original shared Eventide identity with `is_deleted: false`.
 7. Test the inverse ordering where the deleting PC first discovers a newer shared edit. Expected: Eventide asks for an explicit choice before deleting that newer edit.
 
-## Publisher-version compatibility regression (0.8.6)
+## Publisher-version compatibility regression (0.8.7)
 
-1. Publish or modify a printer, filament, capability, quality profile, and quality tombstone with 0.8.6.
-2. Expected: each newly written shared JSON record contains `publisher_plugin_version: 0.8.6-beta`; the manifest is stamped too.
-3. Remove the field from a copy of an old test record. Expected: 0.8.6 still reads the unstamped record.
+1. Publish or modify a printer, filament, capability, active quality profile, and soft-deleted quality record with 0.8.7.
+2. Expected: each newly written shared JSON record contains `publisher_plugin_version: 0.8.7-beta`; the manifest is stamped too.
+3. Remove the field from a copy of an old test record. Expected: 0.8.7 still reads the unstamped record.
 4. In an isolated test library, change a record or manifest stamp to a numerically newer Eventide version (for example `0.9.0-beta`).
-5. Expected: 0.8.6 reports **PLUGIN UPDATE REQUIRED** and does not overwrite that newer data.
+5. Expected: 0.8.7 reports **PLUGIN UPDATE REQUIRED** and does not overwrite that newer data.
+
+## Reversible soft-delete regression (0.8.7)
+
+1. Synchronize a custom profile on PC1 and PC2, then save a copy of its shared `quality/<id>.json` for comparison.
+2. Delete the profile in Cura on PC1. Expected: the same JSON file and Eventide ID remain; revision increments; `is_deleted` becomes `true`; all profile payload fields remain intact.
+3. Expected on PC2: Eventide safely detaches the profile if active, removes its local Eventide-managed containers, and does not republish the stale baseline.
+4. Open the shared JSON manually and change only `is_deleted` from `true` to `false`. Save the file.
+5. Expected: on the next live-sync pass Eventide reinstalls the original profile on both PCs using the same Eventide ID and retained settings. No manual revision edit is required.
+6. Delete the original again, then create a brand-new Cura profile with the same visible name. Expected: the original record remains soft-deleted and the new profile publishes under a different Eventide quality ID.
+7. Verify deleted records are not included in the normal active quality-profile count.
+8. If a legacy 0.8.6 `eventide.shared_profiles.quality_tombstone` exists, expected: 0.8.7 still honors it but never creates a new destructive tombstone.
