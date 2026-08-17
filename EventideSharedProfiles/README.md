@@ -1,4 +1,4 @@
-# Eventide Shared Profiles 0.8.6 Beta
+# Eventide Shared Profiles 0.8.7 Beta
 
 Eventide Shared Profiles is an early beta plugin for UltiMaker Cura 5.13.x that keeps selected Cura configuration objects in a shared filesystem library (including SMB/NAS paths) while leaving Cura itself local and responsive.
 
@@ -17,7 +17,7 @@ Working now:
 - automatic modal alert when a new quality-profile conflict is detected, even if the main Eventide window is closed
 - visible quality-profile conflict queue with explicit **Keep This PC**, **Use Shared Version**, and **Create New Profile** resolution
 - automatic synchronization when shared records change
-- synchronized quality-profile deletion using persistent tombstones
+- synchronized quality-profile soft deletion using reversible `is_deleted` records
 - safe removal of a remotely deleted profile even when that custom profile is currently active
 - publisher-version stamping and stale-plugin overwrite protection
 - printer + material + extruder + nozzle capability records
@@ -55,7 +55,7 @@ Quality records are scoped to an Eventide printer record for synchronization. Cu
 
 ### Deletion synchronization
 
-Deleting a previously synchronized custom quality profile publishes a persistent tombstone rather than erasing its NAS record. Other connected clients remove the corresponding Eventide-managed Cura containers, and an offline client that returns later cannot republish its stale baseline copy. A new profile may reuse the same visible name, but receives a new Eventide quality ID. Tombstones are retained indefinitely in the current beta.
+Deleting a previously synchronized custom quality profile no longer replaces or erases its NAS record. Eventide keeps the complete quality payload and increments the record revision while setting `is_deleted: true`. Other connected clients remove the corresponding Eventide-managed Cura containers, and stale clients cannot silently overwrite the deletion. If recovery is needed, changing only `is_deleted` back to `false` in the shared JSON causes Eventide to reinstall that same profile identity on the next sync. A newly-created Cura profile may still reuse the same visible name and receives a new Eventide quality ID.
 
 If deletion races with an independent edit, Eventide does not guess. The conflict offers **Accept Deletion**, **Keep as New Profile**, and **Restore Profile**. If the deleting PC discovers that the shared copy was edited first, it must explicitly choose whether to delete that newer edit or restore it locally.
 
