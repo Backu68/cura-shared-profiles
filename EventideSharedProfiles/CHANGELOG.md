@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.7-beta
+
+- Changed synchronized quality deletion from destructive tombstones to reversible soft deletion.
+- Quality records now retain their complete profile payload and use `is_deleted: true` as the deletion switch.
+- Deleting a profile increments its revision and records deletion metadata without discarding `global_values`, extruder values, name, Eventide ID, or content hash.
+- Manually changing `is_deleted` from `true` back to `false` in the shared JSON causes Eventide to reinstall the profile on the next synchronization pass.
+- Deleted records are synchronized before active records so a newly-created profile can safely reuse the same visible name under a new Eventide ID.
+- Active-profile detachment, stale-client protection, deletion/edit conflicts, and publisher-version guards remain in place.
+- Legacy 0.8.6 `quality_tombstone` records remain readable for backward compatibility, but 0.8.7 no longer creates them.
+
 ## 0.8.6-beta
 
 - Added synchronized quality-profile deletion with persistent tombstones.
@@ -64,7 +74,7 @@
 ## 0.7.1-beta
 
 - Added portable custom-material publish/import with preserved GUID.
-- Added machine-instance publish/recreation when the target has the same Cura base definition.
+- Added machine-instance publish/recreation when the target has the same base definition.
 - Added explicit Sync Library to Cura action.
 
 ## 0.7.0-beta
