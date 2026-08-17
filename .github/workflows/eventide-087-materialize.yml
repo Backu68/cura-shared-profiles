@@ -1,0 +1,46 @@
+name: Eventide 0.8.7 release materializer
+
+on:
+  push:
+    branches:
+      - release/v0.8.7-beta
+    paths:
+      - '.github/workflows/eventide-087-materialize.yml'
+      - '.release-staging/python087.diff'
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release/v0.8.7-beta
+          fetch-depth: 0
+
+      - name: Verify patch
+        run: |
+          echo '4e2f37be76d8cc4ab1ac0ff6f38fc752c226e425b6ffcc129c51f0866f7759b7  .release-staging/python087.diff' | sha256sum -c -
+          test "$(sha256sum EventideSharedProfiles/EventideSharedProfiles.py | cut -d' ' -f1)" = "955aa2a5b296f8a77b81024f371650e072133de6a9828e871c63ff67976ec923"
+          patch --dry-run -p0 < .release-staging/python087.diff
+
+      - name: Materialize v0.8.7 source
+        run: |
+          patch -p0 < .release-staging/python087.diff
+          test "$(sha256sum EventideSharedProfiles/EventideSharedProfiles.py | cut -d' ' -f1)" = "4e7ce00aad03fe5ac01d9761eb561fd024c7e3cbb6e5d54aff5c235a56be89df"
+          python -m py_compile EventideSharedProfiles/EventideSharedProfiles.py EventideSharedProfiles/__init__.py
+          grep -q 'PLUGIN_VERSION = "0.8.7"' EventideSharedProfiles/EventideSharedProfiles.py
+          grep -q 'PUBLISHER_PLUGIN_VERSION = "0.8.7-beta"' EventideSharedProfiles/EventideSharedProfiles.py
+          grep -q '"version": "0.8.7"' EventideSharedProfiles/plugin.json
+
+      - name: Commit clean release source
+        run: |
+          rm -rf .release-staging
+          rm -f .github/workflows/eventide-087-materialize.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Release v0.8.7 beta'
+          git push origin HEAD:release/v0.8.7-beta
