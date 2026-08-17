@@ -28,9 +28,11 @@ class EventideSharedProfiles(QObject, Extension):
     stateChanged = pyqtSignal()
 
     CONFIG_FILENAME = "eventide_shared_profiles.json"
-    PLUGIN_VERSION = "0.8.6"
-    PUBLISHER_PLUGIN_VERSION = "0.8.6-beta"
+    PLUGIN_VERSION = "0.8.7"
+    PUBLISHER_PLUGIN_VERSION = "0.8.7-beta"
     QUALITY_SCHEMA = "eventide.shared_profiles.quality"
+    # Legacy 0.8.6 destructive tombstones are read-only compatibility input.
+    # 0.8.7+ uses QUALITY_SCHEMA with is_deleted=true so the full payload survives.
     QUALITY_TOMBSTONE_SCHEMA = "eventide.shared_profiles.quality_tombstone"
     LIBRARY_FORMAT = 1
     RECORD_FORMAT = 1
@@ -2276,6 +2278,7 @@ class EventideSharedProfiles(QObject, Extension):
             "created_utc": now,
             "updated_utc": now,
             "updated_by": self._writer_info(),
+            "is_deleted": False,
             **copy_payload,
         }
 
@@ -2404,12 +2407,17 @@ class EventideSharedProfiles(QObject, Extension):
                         record = self._read_json(path)
                         if record.get("id") != quality_id:
                             raise ValueError("quality record identity mismatch")
-                        if record.get("schema") == self.QUALITY_TOMBSTONE_SCHEMA:
+                        if self._quality_is_deleted(record):
                             deletion = self._quality_tombstone_deletion(record)
                             state = dict(self._quality_sync_state.get(quality_id, {}) or {})
                             seen_hash = str(state.get("content_hash", "") or "")
-                            deleted_hash = str(deletion.get("deleted_content_hash", "") or "")
-                            # A stale/baseline copy must not resurrect a tombstoned profile.
+                            deleted_hash = str(
+                                deletion.get("deleted_content_hash", "")
+                                or record.get("content_hash", "")
+                                or ""
+                            )
+                            # A stale/baseline copy must not resurrect a soft-deleted profile.
+                            # An independently edited local copy still becomes a deletion conflict.
                             if local_hash == deleted_hash or (seen_hash and local_hash == seen_hash):
                                 stats["skipped"] += 1
                                 continue
@@ -2487,6 +2495,7 @@ class EventideSharedProfiles(QObject, Extension):
                         "created_utc": created_utc,
                         "updated_utc": now,
                         "updated_by": self._writer_info(),
+                        "is_deleted": False,
                         **payload,
                     }
                     self._atomic_write_json(path, record)
@@ -2522,7 +2531,7 @@ class EventideSharedProfiles(QObject, Extension):
                 self._last_quality_sync_summary = "QUALITY CONFLICT: {} profile(s) changed both locally and in the shared library.".format(stats["conflicts"])
             elif stats["changed"]:
                 if stats.get("deleted", 0):
-                    self._last_quality_sync_summary = "Live quality sync published {} change(s), including {} deletion tombstone(s).".format(
+                    self._last_quality_sync_summary = "Live quality sync published {} change(s), including {} deletion(s).".format(
                         stats["changed"], stats.get("deleted", 0)
                     )
                 else:
@@ -2618,25 +2627,40 @@ class EventideSharedProfiles(QObject, Extension):
 
     @staticmethod
     def _quality_tombstone_deletion(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Return deletion metadata from both 0.8.6 tombstones and 0.8.7 soft-deleted records."""
         deletion = record.get("deletion", {})
         return dict(deletion) if isinstance(deletion, dict) else {}
 
+    def _quality_is_deleted(self, record: Dict[str, Any]) -> bool:
+        """Deletion is a reversible record state in 0.8.7+.
+
+        The separate tombstone schema is accepted only for 0.8.6 backward
+        compatibility. New records keep QUALITY_SCHEMA and their complete
+        profile payload, with only is_deleted toggled.
+        """
+        if str(record.get("schema", "") or "") == self.QUALITY_TOMBSTONE_SCHEMA:
+            return True
+        return record.get("is_deleted", False) is True
+
     def _make_quality_tombstone(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Soft-delete a quality record without discarding any profile data.
+
+        Kept under the historical helper name to minimize churn in the conflict
+        machinery. Unlike 0.8.6, this no longer creates a destructive tombstone.
+        """
         now = self._utc_now()
         remote_revision = int(record.get("revision", 0) or 0)
         deletion_id = str(uuid.uuid4())
-        return {
-            "schema": self.QUALITY_TOMBSTONE_SCHEMA,
+        deleted_record = dict(record)
+        deleted_record.update({
+            "schema": self.QUALITY_SCHEMA,
             "format": self.RECORD_FORMAT,
             "id": str(record.get("id", "") or ""),
             "revision": remote_revision + 1,
             "created_utc": record.get("created_utc", now),
             "updated_utc": now,
             "updated_by": self._writer_info(),
-            "printer_id": str(record.get("printer_id", "") or ""),
-            "name": str(record.get("name", "") or "Shared Profile"),
-            "quality_definition": str(record.get("quality_definition", "") or ""),
-            "deleted": True,
+            "is_deleted": True,
             "deletion": {
                 "id": deletion_id,
                 "deleted_utc": now,
@@ -2644,7 +2668,10 @@ class EventideSharedProfiles(QObject, Extension):
                 "deleted_from_revision": remote_revision,
                 "deleted_content_hash": str(record.get("content_hash", "") or ""),
             },
-        }
+        })
+        # Never emit the old destructive tombstone flag from 0.8.7+.
+        deleted_record.pop("deleted", None)
+        return deleted_record
 
     def _quality_is_active(self, quality_id: str) -> bool:
         global_container, extruders = self._quality_local_containers(quality_id)
@@ -2720,7 +2747,7 @@ class EventideSharedProfiles(QObject, Extension):
         return removed
 
     def _publish_local_quality_deletions(self, root: str, printer_id: str, present_quality_ids: set) -> Dict[str, int]:
-        """Turn confirmed local removal of an Eventide-managed quality into tombstones."""
+        """Soft-delete confirmed removals while retaining the complete shared profile payload."""
         stats = {"changed": 0, "deleted": 0, "conflicts": 0, "current": 0}
         for quality_id, raw_state in list(self._quality_sync_state.items()):
             state = dict(raw_state or {}) if isinstance(raw_state, dict) else {}
@@ -2729,7 +2756,7 @@ class EventideSharedProfiles(QObject, Extension):
             if bool(state.get("deleted", False)) or quality_id in present_quality_ids:
                 continue
             # Do not infer deletion from ContainerTree filtering. Only publish a
-            # tombstone once the stamped containers are actually gone from the registry.
+            # mark the record deleted only once the stamped containers are actually gone from the registry.
             global_container, extruders = self._quality_local_containers(quality_id)
             if global_container is not None or extruders:
                 continue
@@ -2738,11 +2765,16 @@ class EventideSharedProfiles(QObject, Extension):
                 continue
             record = self._read_json(path)
             schema = str(record.get("schema", "") or "")
-            if schema == self.QUALITY_TOMBSTONE_SCHEMA:
+            if self._quality_is_deleted(record):
                 deletion = self._quality_tombstone_deletion(record)
                 self._quality_sync_state[quality_id] = {
                     "revision": int(record.get("revision", 0) or 0),
-                    "content_hash": str(deletion.get("deleted_content_hash", "") or state.get("content_hash", "") or ""),
+                    "content_hash": str(
+                        deletion.get("deleted_content_hash", "")
+                        or record.get("content_hash", "")
+                        or state.get("content_hash", "")
+                        or ""
+                    ),
                     "printer_id": printer_id,
                     "deleted": True,
                     "deletion_id": str(deletion.get("id", "") or ""),
@@ -2775,7 +2807,7 @@ class EventideSharedProfiles(QObject, Extension):
             deletion = self._quality_tombstone_deletion(tombstone)
             self._quality_sync_state[quality_id] = {
                 "revision": int(tombstone.get("revision", 0) or 0),
-                "content_hash": str(deletion.get("deleted_content_hash", "") or remote_hash),
+                "content_hash": str(deletion.get("deleted_content_hash", "") or tombstone.get("content_hash", "") or remote_hash),
                 "printer_id": printer_id,
                 "deleted": True,
                 "deletion_id": str(deletion.get("id", "") or ""),
@@ -2789,9 +2821,9 @@ class EventideSharedProfiles(QObject, Extension):
         quality_id = str(record.get("id", "") or "").strip()
         printer_id = str(record.get("printer_id", "") or "").strip()
         if not quality_id:
-            raise ValueError("quality tombstone missing id")
+            raise ValueError("deleted quality record missing id")
         deletion = self._quality_tombstone_deletion(record)
-        deleted_hash = str(deletion.get("deleted_content_hash", "") or "")
+        deleted_hash = str(deletion.get("deleted_content_hash", "") or record.get("content_hash", "") or "")
         remote_revision = int(record.get("revision", 0) or 0)
         state = dict(self._quality_sync_state.get(quality_id, {}) or {})
         global_container, extruders = self._quality_local_containers(quality_id)
@@ -2866,6 +2898,36 @@ class EventideSharedProfiles(QObject, Extension):
         printer_id = str(record.get("printer_id", "") or "").strip()
         if not quality_id or not printer_id:
             raise ValueError("quality record missing id or printer_id")
+        if self._quality_is_deleted(record):
+            return self._apply_quality_tombstone(root, record, force=force)
+
+        # Soft deletion was introduced after some beta clients were already in
+        # circulation. A pre-0.8.7 client does not understand is_deleted and can
+        # reconstruct an ordinary active record if its stale local copy is later
+        # edited. If this client previously synchronized the deletion, distinguish
+        # that stale resurrection from an intentional 0.8.7 recovery:
+        #   * unchanged old baseline -> reassert the soft deletion automatically
+        #   * independently edited old copy -> raise the normal delete/edit conflict
+        # A manual is_deleted:false edit retains the 0.8.7 publisher stamp and is
+        # therefore accepted below as an intentional recovery.
+        prior_state = dict(self._quality_sync_state.get(quality_id, {}) or {})
+        if bool(prior_state.get("deleted", False)):
+            published = str(record.get("publisher_plugin_version", "") or "").strip()
+            is_pre_soft_delete_writer = (
+                not published
+                or self._version_tuple(published) < self._version_tuple("0.8.7-beta")
+            )
+            if is_pre_soft_delete_writer:
+                remote_hash = str(record.get("content_hash", "") or "")
+                deleted_hash = str(prior_state.get("content_hash", "") or "")
+                if deleted_hash and remote_hash == deleted_hash:
+                    re_deleted = self._make_quality_tombstone(record)
+                    path = os.path.join(root, "quality", quality_id + ".json")
+                    self._atomic_write_json(path, re_deleted)
+                    self._touch_manifest(root)
+                    return self._apply_quality_tombstone(root, re_deleted, force=True)
+                self._register_local_delete_remote_edit_conflict(quality_id, record)
+                return "deletion-conflict"
         printer_path = os.path.join(root, "printers", printer_id + ".json")
         if not os.path.isfile(printer_path):
             return "missing-printer-record"
@@ -3006,9 +3068,10 @@ class EventideSharedProfiles(QObject, Extension):
             names = sorted(name for name in os.listdir(quality_dir) if name.lower().endswith(".json"))
         except OSError:
             names = []
-        # Read first, then apply tombstones before live records. A deleted name may
-        # legitimately be reused by a newly-created profile with a new Eventide ID;
-        # removing the old identity first avoids a transient false name conflict.
+        # Read first, then apply deleted records before active records. A deleted
+        # name may legitimately be reused by a newly-created profile with a new
+        # Eventide ID; removing the old identity first avoids a transient false
+        # name conflict.
         queued: List[Tuple[str, Dict[str, Any]]] = []
         for name in names:
             try:
@@ -3023,14 +3086,14 @@ class EventideSharedProfiles(QObject, Extension):
 
         queued.sort(
             key=lambda item: (
-                0 if str(item[1].get("schema", "") or "") == self.QUALITY_TOMBSTONE_SCHEMA else 1,
+                0 if self._quality_is_deleted(item[1]) else 1,
                 item[0],
             )
         )
         for name, record in queued:
             try:
                 schema = str(record.get("schema", "") or "")
-                if schema == self.QUALITY_TOMBSTONE_SCHEMA:
+                if self._quality_is_deleted(record):
                     outcome = self._apply_quality_tombstone(root, record)
                 else:
                     outcome = self._apply_quality_record(root, record)
@@ -3075,7 +3138,7 @@ class EventideSharedProfiles(QObject, Extension):
             action = str(strategy or "").strip().lower()
 
             if conflict_kind == "deletion":
-                if record.get("schema") != self.QUALITY_TOMBSTONE_SCHEMA:
+                if not self._quality_is_deleted(record):
                     raise ValueError("the shared deletion was superseded; synchronize again")
                 printer_id = str(record.get("printer_id", "") or "").strip()
                 global_container, extruder_containers = self._quality_local_containers(quality_id)
@@ -3106,7 +3169,8 @@ class EventideSharedProfiles(QObject, Extension):
                         result = "CONFLICT RESOLVED: preserved this PC's edit as '{}' and accepted deletion of the original.".format(final_name)
                     elif action == "restore_profile":
                         now = self._utc_now()
-                        restored = {
+                        restored = dict(record)
+                        restored.update({
                             "schema": self.QUALITY_SCHEMA,
                             "format": self.RECORD_FORMAT,
                             "id": quality_id,
@@ -3114,13 +3178,15 @@ class EventideSharedProfiles(QObject, Extension):
                             "created_utc": record.get("created_utc", now),
                             "updated_utc": now,
                             "updated_by": self._writer_info(),
+                            "is_deleted": False,
                             **local_payload,
                             "restored_from_deletion": {
                                 "deletion_id": str(self._quality_tombstone_deletion(record).get("id", "") or ""),
                                 "restored_utc": now,
                                 "restored_by": self._writer_info(),
                             },
-                        }
+                        })
+                        restored.pop("deleted", None)
                         self._atomic_write_json(path, restored)
                         self._quality_sync_state[quality_id] = {
                             "revision": int(restored["revision"]),
@@ -3143,7 +3209,7 @@ class EventideSharedProfiles(QObject, Extension):
                     deletion = self._quality_tombstone_deletion(tombstone)
                     self._quality_sync_state[quality_id] = {
                         "revision": int(tombstone.get("revision", 0) or 0),
-                        "content_hash": str(deletion.get("deleted_content_hash", "") or ""),
+                        "content_hash": str(deletion.get("deleted_content_hash", "") or tombstone.get("content_hash", "") or ""),
                         "printer_id": str(tombstone.get("printer_id", "") or ""),
                         "deleted": True,
                         "deletion_id": str(deletion.get("id", "") or ""),
@@ -3162,8 +3228,8 @@ class EventideSharedProfiles(QObject, Extension):
                     raise ValueError("choose Accept Deletion or Restore Profile for this conflict")
 
             else:
-                if record.get("schema") != self.QUALITY_SCHEMA:
-                    raise ValueError("the shared profile changed type; synchronize again")
+                if record.get("schema") != self.QUALITY_SCHEMA or self._quality_is_deleted(record):
+                    raise ValueError("the shared profile changed state; synchronize again")
                 printer_id = str(record.get("printer_id", "") or "").strip()
                 global_container, extruder_containers = self._quality_local_containers(quality_id)
                 if global_container is None:
@@ -3186,6 +3252,7 @@ class EventideSharedProfiles(QObject, Extension):
                         "created_utc": record.get("created_utc", now),
                         "updated_utc": now,
                         "updated_by": self._writer_info(),
+                        "is_deleted": False,
                         **local_payload,
                         "resolution": {
                             "id": resolution_id,
@@ -3408,10 +3475,18 @@ class EventideSharedProfiles(QObject, Extension):
                 if not str(record.get("name", "") or "").strip():
                     errors.append("{}: quality profile name is blank".format(name))
                 if record.get("schema") == self.QUALITY_TOMBSTONE_SCHEMA:
+                    # Legacy 0.8.6 destructive tombstone. Readable for migration,
+                    # but 0.8.7 never writes this shape.
                     deletion = self._quality_tombstone_deletion(record)
                     if not record.get("deleted") or not str(deletion.get("id", "") or ""):
-                        errors.append("{}: invalid quality tombstone".format(name))
+                        errors.append("{}: invalid legacy quality tombstone".format(name))
                     continue
+                if "is_deleted" in record and not isinstance(record.get("is_deleted"), bool):
+                    errors.append("{}: is_deleted must be true or false".format(name))
+                if self._quality_is_deleted(record):
+                    deletion = self._quality_tombstone_deletion(record)
+                    if not str(deletion.get("id", "") or ""):
+                        errors.append("{}: deleted quality record is missing deletion metadata".format(name))
                 content_hash = str(record.get("content_hash", "") or "")
                 payload = {
                     "printer_id": record.get("printer_id"),
@@ -4329,7 +4404,21 @@ class EventideSharedProfiles(QObject, Extension):
         self._printer_count = self._count_json_files(os.path.join(root, "printers"))
         self._filament_count = self._count_json_files(os.path.join(root, "filaments"))
         self._capability_count = self._count_json_files(os.path.join(root, "capabilities"))
-        self._quality_count = self._count_json_files(os.path.join(root, "quality"))
+        self._quality_count = 0
+        quality_dir = os.path.join(root, "quality")
+        try:
+            for filename in os.listdir(quality_dir):
+                if not filename.lower().endswith(".json"):
+                    continue
+                try:
+                    record = self._read_json(os.path.join(quality_dir, filename))
+                    if not self._quality_is_deleted(record):
+                        self._quality_count += 1
+                except Exception:
+                    # Validation reports malformed/newer records separately.
+                    continue
+        except OSError:
+            pass
 
         if not self._active_printer_id or not self._active_material_id:
             self._current_registration = "Current Cura selection incomplete"
