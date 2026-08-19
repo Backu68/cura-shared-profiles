@@ -1,0 +1,57 @@
+name: Eventide 0.9.0 alpha 1 materializer
+
+on:
+  push:
+    branches:
+      - refactor/0.9.0
+    paths:
+      - '.github/workflows/eventide-090a1-materialize.yml'
+      - '.refactor-staging/**'
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/0.9.0
+          fetch-depth: 0
+
+      - name: Reassemble and verify checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .refactor-staging/payload_*.b64 > /tmp/eventide-090a1.b64
+          base64 --decode /tmp/eventide-090a1.b64 > /tmp/eventide-090a1.tar.xz
+          echo '537269e1c53650e8eb6494a3441d3f92733ce982f01e0687719970ecffea113b  /tmp/eventide-090a1.tar.xz' | sha256sum -c -
+
+      - name: Materialize refactor checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xJf /tmp/eventide-090a1.tar.xz -C .
+          rm -rf .refactor-staging
+          rm -f .github/workflows/eventide-090a1-materialize.yml
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          grep -q 'PLUGIN_VERSION = "0.9.0-alpha.1"' EventideSharedProfiles/EventideSharedProfiles.py
+          grep -q 'PUBLISHER_PLUGIN_VERSION = "0.9.0-alpha.1"' EventideSharedProfiles/EventideSharedProfiles.py
+          grep -q '"version": "0.9.0-alpha.1"' EventideSharedProfiles/plugin.json
+          python -m compileall -q EventideSharedProfiles
+          python -m unittest discover -s tests -v
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
+      - name: Commit clean checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'Refactor v0.9.0-alpha.1 checkpoint'
+          git push origin HEAD:refactor/0.9.0
