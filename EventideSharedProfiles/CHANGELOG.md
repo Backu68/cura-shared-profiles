@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.0-alpha.5
+
+- Fix Klipper Pressure Advance emission by appending the command only after Cura 5.13 has finished building its copied global/extruder settings cache.
+- Reuse the already-resolved Eventide capability snapshot for PA instead of resolving the material a second time during the global-settings pass.
+- Keep PA slice-only: no live Cura stack mutation and no finished-G-code rewriting.
+- Extend slice diagnostics so successful or failed PA emission remains visible after extruder capability resolution.
+
 ## 0.9.0-alpha.4
 
 - Restored Pressure Advance as a printer/material/nozzle capability field.

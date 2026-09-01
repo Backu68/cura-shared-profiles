@@ -32,8 +32,8 @@ class EventideSharedProfiles(QObject, Extension):
 
     stateChanged = pyqtSignal()
 
-    PLUGIN_VERSION = "0.9.0-alpha.4"
-    PUBLISHER_PLUGIN_VERSION = "0.9.0-alpha.4"
+    PLUGIN_VERSION = "0.9.0-alpha.5"
+    PUBLISHER_PLUGIN_VERSION = "0.9.0-alpha.5"
     QUALITY_SCHEMA = "eventide.shared_profiles.quality"
     # Legacy 0.8.6 destructive tombstones are read-only compatibility input.
     # 0.8.7+ uses QUALITY_SCHEMA with is_deleted=true so the full payload survives.
@@ -1119,28 +1119,27 @@ class EventideSharedProfiles(QObject, Extension):
 
         return values, changed
 
-    def _apply_klipper_pa_to_global_slice_values(
-        self,
-        settings: Dict[str, Any],
-    ) -> Tuple[Dict[str, Any], str]:
-        """Add capability PA to Cura's transient copied machine start G-code.
+    def _apply_klipper_pa_to_cached_slice_settings(self, job_self: Any) -> str:
+        """Append capability PA after Cura has cached global + extruder settings.
 
-        This runs inside the existing StartSliceJob copied-settings hook. It does
-        not mutate Cura's live stack and does not rewrite finished G-code. Alpha.4
-        deliberately supports exactly one enabled extruder until Eventide has an
-        explicit Cura-to-Klipper extruder-name mapping.
+        Cura 5.13 builds the complete ``_all_extruders_settings`` cache before
+        sending global settings to CuraEngine. Waiting until that cache is
+        complete means Eventide can use the exact capability snapshot already
+        resolved for the enabled extruder, then alter only the copied global
+        ``machine_start_gcode`` value. No live Cura container is changed and no
+        finished G-code is rewritten.
         """
-        values = dict(settings)
-        if not self._shared_library_path:
-            return values, ""
+        cached = getattr(job_self, "_all_extruders_settings", None)
+        if not isinstance(cached, dict):
+            return "Klipper PA not emitted: Cura settings cache unavailable"
 
-        root = os.path.normpath(self._shared_library_path)
-        if not os.path.isfile(self._manifest_path(root)):
-            return values, ""
+        global_values = cached.get("-1")
+        if not isinstance(global_values, dict):
+            return "Klipper PA not emitted: global settings cache unavailable"
 
         global_stack = self._application.getGlobalContainerStack()
         if global_stack is None:
-            return values, "Klipper PA not emitted: no active printer stack"
+            return "Klipper PA not emitted: no active printer stack"
 
         enabled_extruders = [
             extruder
@@ -1148,60 +1147,59 @@ class EventideSharedProfiles(QObject, Extension):
             if bool(getattr(extruder, "isEnabled", True))
         ]
         if len(enabled_extruders) != 1:
-            return values, "Klipper PA not emitted: requires exactly one enabled extruder"
+            return "Klipper PA not emitted: requires exactly one enabled extruder"
 
         extruder_stack = enabled_extruders[0]
-        effective_settings: Dict[str, Any] = {}
         try:
-            keys = extruder_stack.getAllKeys()
-        except (AttributeError, TypeError):
-            keys = []
-        for key in keys:
-            try:
-                effective_settings[str(key)] = extruder_stack.getProperty(key, "value")
-            except Exception:
-                Logger.logException(
-                    "w",
-                    "Eventide could not read extruder setting %s while resolving Klipper PA",
-                    key,
-                )
+            position = int(extruder_stack.getMetaDataEntry("position", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            position = 0
 
-        try:
-            record, context = self._find_capability_for_slice_stack(
-                root, extruder_stack, effective_settings
-            )
-        except FileNotFoundError:
-            return values, ""
-        except Exception as error:
-            Logger.logException("e", "Eventide Klipper PA slice resolution failed")
-            return values, "Klipper PA not emitted: {}".format(error)
+        snapshot = self._slice_capability_snapshots.get(position)
+        if not isinstance(snapshot, dict):
+            return "Klipper PA not emitted: no resolved capability snapshot"
+
+        record = snapshot.get("record", {})
+        if not isinstance(record, dict):
+            return "Klipper PA not emitted: capability snapshot is invalid"
 
         tuning = record.get("tuning", {})
+        if not isinstance(tuning, dict):
+            return "Klipper PA not emitted: capability tuning data is invalid"
         if not bool(tuning.get("emit_klipper_pressure_advance", False)):
-            return values, ""
+            return ""
 
         pressure_advance = tuning.get("pressure_advance")
         if pressure_advance in (None, ""):
-            return values, "Klipper PA not emitted: enabled but value is unset"
+            return "Klipper PA not emitted: enabled but value is unset"
         try:
             pressure_advance = float(pressure_advance)
         except (TypeError, ValueError):
-            return values, "Klipper PA not emitted: invalid value"
+            return "Klipper PA not emitted: invalid value"
         if pressure_advance < 0:
-            return values, "Klipper PA not emitted: value must be at least 0"
+            return "Klipper PA not emitted: value must be at least 0"
 
-        if "machine_start_gcode" not in values:
-            return values, "Klipper PA not emitted: machine_start_gcode unavailable"
+        if "machine_start_gcode" not in global_values:
+            return "Klipper PA not emitted: machine_start_gcode unavailable"
 
-        start_gcode = str(values.get("machine_start_gcode", "") or "")
+        start_gcode = str(global_values.get("machine_start_gcode", "") or "")
         command = "SET_PRESSURE_ADVANCE ADVANCE={:g} ; Eventide Shared Profiles".format(
             pressure_advance
         )
-        separator = "" if not start_gcode or start_gcode.endswith(("\n", "\r")) else "\n"
-        values["machine_start_gcode"] = start_gcode + separator + command
-        return values, "Klipper PA={:g} ({})".format(
-            pressure_advance, context.get("material_name", "material")
-        )
+
+        # A fresh StartSliceJob cache normally makes this impossible, but keep
+        # the operation idempotent in case another plugin re-enters the cache
+        # builder during the same job.
+        if command not in start_gcode.splitlines():
+            separator = (
+                ""
+                if not start_gcode or start_gcode.endswith(("\n", "\r"))
+                else "\n"
+            )
+            global_values["machine_start_gcode"] = start_gcode + separator + command
+
+        material_name = str(snapshot.get("material_name", "material") or "material")
+        return "Klipper PA={:g} ({})".format(pressure_advance, material_name)
 
     def _transform_slice_settings(
         self,
@@ -1214,14 +1212,10 @@ class EventideSharedProfiles(QObject, Extension):
         # ever leaking into a later slice.
         if getattr(stack, "material", None) is None:
             self._slice_capability_snapshots = {}
-            transformed, pa_note = self._apply_klipper_pa_to_global_slice_values(
-                original_values
-            )
             self._last_slice_resolution = (
                 "Slice started; resolving Eventide capabilities per extruder."
-                + ((" " + pa_note) if pa_note else "")
             )
-            return transformed
+            return original_values
 
         if not self._shared_library_path:
             return original_values
@@ -1290,7 +1284,7 @@ class EventideSharedProfiles(QObject, Extension):
             return original_values
 
     def _install_slice_settings_hook(self) -> bool:
-        """Patch Cura 5.13 StartSliceJob's copied-settings stage, not live stacks."""
+        """Patch Cura 5.13's copied-settings/cache stages, never live stacks."""
         if self._slice_hook_installed:
             return True
 
@@ -1302,6 +1296,7 @@ class EventideSharedProfiles(QObject, Extension):
             if (
                 isinstance(candidate, type)
                 and hasattr(candidate, "_buildReplacementTokens")
+                and hasattr(candidate, "_cacheAllExtruderSettings")
             ):
                 target_class = candidate
                 break
@@ -1312,32 +1307,59 @@ class EventideSharedProfiles(QObject, Extension):
             )
             return False
 
-        if hasattr(target_class, "_eventide_original_buildReplacementTokens"):
-            target_class._eventide_owner = self
-            self._slice_hook_installed = True
-            self._last_slice_resolution = "Slice-time Eventide hook is active."
-            self.stateChanged.emit()
-            return True
-
-        original = target_class._buildReplacementTokens
-        target_class._eventide_original_buildReplacementTokens = original
         target_class._eventide_owner = self
 
-        def eventide_build_replacement_tokens(job_self: Any, stack: Any) -> Dict[str, Any]:
-            base_values = target_class._eventide_original_buildReplacementTokens(
-                job_self,
-                stack,
-            )
-            owner = getattr(target_class, "_eventide_owner", None)
-            if owner is None:
-                return base_values
-            return owner._transform_slice_settings(stack, base_values)
+        # Existing alpha.3 capability enforcement hook: transform only the
+        # copied settings dictionaries returned to StartSliceJob.
+        if not hasattr(target_class, "_eventide_original_buildReplacementTokens"):
+            original_build_tokens = target_class._buildReplacementTokens
+            target_class._eventide_original_buildReplacementTokens = original_build_tokens
 
-        target_class._buildReplacementTokens = eventide_build_replacement_tokens
+            def eventide_build_replacement_tokens(
+                job_self: Any,
+                stack: Any,
+            ) -> Dict[str, Any]:
+                base_values = target_class._eventide_original_buildReplacementTokens(
+                    job_self,
+                    stack,
+                )
+                owner = getattr(target_class, "_eventide_owner", None)
+                if owner is None:
+                    return base_values
+                return owner._transform_slice_settings(stack, base_values)
+
+            target_class._buildReplacementTokens = eventide_build_replacement_tokens
+
+        # Alpha.5 PA hook: Cura's cache builder first invokes the transformed
+        # global/extruder token hooks above, which resolves and snapshots the
+        # material capability. Only after that complete cache exists do we
+        # append PA to the copied machine_start_gcode value.
+        if not hasattr(target_class, "_eventide_original_cacheAllExtruderSettings"):
+            original_cache = target_class._cacheAllExtruderSettings
+            target_class._eventide_original_cacheAllExtruderSettings = original_cache
+
+            def eventide_cache_all_extruder_settings(job_self: Any) -> None:
+                target_class._eventide_original_cacheAllExtruderSettings(job_self)
+                owner = getattr(target_class, "_eventide_owner", None)
+                if owner is None:
+                    return
+                pa_note = owner._apply_klipper_pa_to_cached_slice_settings(job_self)
+                if pa_note:
+                    if owner._last_slice_resolution:
+                        owner._last_slice_resolution += " | " + pa_note
+                    else:
+                        owner._last_slice_resolution = pa_note
+                    Logger.log("i", "Eventide %s", pa_note)
+
+            target_class._cacheAllExtruderSettings = eventide_cache_all_extruder_settings
+
         self._slice_hook_installed = True
-        self._last_slice_resolution = "Slice-time Eventide hook is active."
+        self._last_slice_resolution = "Slice-time Eventide hooks are active."
         self.stateChanged.emit()
-        Logger.log("i", "Eventide installed transient StartSliceJob settings hook")
+        Logger.log(
+            "i",
+            "Eventide installed transient StartSliceJob settings + PA cache hooks",
+        )
         return True
 
     @pyqtSlot(str, result=str)
