@@ -1,72 +1,75 @@
-# Eventide Shared Profiles 0.8.7 Beta
+# Eventide Shared Profiles v0.9.0-alpha.3 — Exact Archive
 
-Eventide Shared Profiles is an early beta plugin for UltiMaker Cura 5.13.x that keeps selected Cura configuration objects in a shared filesystem library (including SMB/NAS paths) while leaving Cura itself local and responsive.
+This branch is an immutable archive of the **exact v0.9.0-alpha.3 ZIP produced in the ChatGPT 3D Printer project thread**.
 
-## Current beta scope
+It is intentionally separate from `main` and from active 0.9 development. Do not treat this branch as a development branch and do not merge it into `main`.
 
-Working now:
+## Canonical artifact
 
-- portable custom-material publish/import with preserved Cura GUID
-- machine-instance publish/recreation when the target Cura has the same base definition
-- **two-way shared custom quality-profile synchronization**
-  - global + per-extruder `quality_changes` groups
-  - Eventide-scoped to the shared printer record
-  - stable cross-PC Eventide identity
-  - revision/content-hash conflict protection
-- **live shared-library polling** (SMB-friendly; no native filesystem watcher required)
-- automatic modal alert when a new quality-profile conflict is detected, even if the main Eventide window is closed
-- visible quality-profile conflict queue with explicit **Keep This PC**, **Use Shared Version**, and **Create New Profile** resolution
-- automatic synchronization when shared records change
-- synchronized quality-profile soft deletion using reversible `is_deleted` records
-- safe removal of a remotely deleted profile even when that custom profile is currently active
-- publisher-version stamping and stale-plugin overwrite protection
-- printer + material + extruder + nozzle capability records
-- transient slice-time capability injection without persistent Cura `userChanges`
-- max linear-speed and max volumetric-flow enforcement
-- temperature offset, retraction override, material-flow multiplier
-- optional Klipper `SET_PRESSURE_ADVANCE`
-- single-extruder final G-code hard-limit guardrail
-- optimistic record revision conflict protection and atomic JSON writes
-- native folder **Browse…** button for the shared library path
-- library validation and diagnostics export under Advanced
+Filename: `EventideSharedProfiles-v0.9.0-alpha.3.zip`
 
-## Normal workflow
+Size: `57803` bytes
 
-1. Install the plugin and restart Cura.
-2. Open **Extensions → Eventide Shared Profiles**.
-3. **Browse…** to the shared library and click **Connect**.
-4. On a source Cura install, choose the printer/material and click **Share current setup**.
-5. Custom Cura quality profiles for that shared printer are then published and updated automatically while Cura is running.
-6. Other connected Cura installs automatically detect shared changes and install/update shared quality profiles when safe.
+SHA-256:
 
-## Quality-profile safety
+`e87b8c98e7c89fa0457ba89dadfe5b6094816fe7bb3dc05cac0df300c5bf6a03`
 
-Cura represents one visible custom profile as a group containing a global `quality_changes` container and one container per extruder. Eventide stores and restores that group together.
+The exact ZIP is stored as Base64 chunks in `parts/`, split only because the GitHub connector could not directly transfer the binary artifact. The chunks themselves were verified against the local canonical ZIP by Git blob SHA before this archive commit was created.
 
-Eventide never overwrites a quality profile when both the local copy and the shared copy changed since the last synchronization. It reports the conflict in the normal **Profiles** tab and offers three explicit resolutions:
+## Reconstruct the exact ZIP
 
-- **Keep This PC** — publish this PC's edit as an authoritative shared resolution; clients still holding the resolved losing/baseline version automatically accept the chosen winner.
-- **Use Shared Version** — replace this PC's conflicting copy with the current NAS version.
-- **Create New Profile** — preserve this PC's edit under an editable new profile name, then restore the original profile to the current shared version.
+Linux/macOS/Git Bash:
 
-A later independent edit that is not part of the resolved conflict remains protected; Eventide does not use a Keep This PC decision to bulldoze unrelated new work.
+```bash
+cat parts/*.b64 | base64 --decode > EventideSharedProfiles-v0.9.0-alpha.3.zip
+sha256sum EventideSharedProfiles-v0.9.0-alpha.3.zip
+unzip EventideSharedProfiles-v0.9.0-alpha.3.zip
+```
 
-Quality records are scoped to an Eventide printer record for synchronization. Cura itself exposes custom profiles by **quality definition**, not by unique machine instance. Printers with unique quality definitions therefore behave machine-specific; generic/custom printers that share Cura's `fdmprinter` quality definition may still show the same installed custom profile in Cura's native profile list. Eventide does not currently override Cura's native filtering behavior.
+PowerShell:
 
-### Deletion synchronization
+```powershell
+$b64 = (Get-ChildItem parts\*.b64 | Sort-Object Name | ForEach-Object { Get-Content $_ -Raw }) -join ''
+[IO.File]::WriteAllBytes('EventideSharedProfiles-v0.9.0-alpha.3.zip', [Convert]::FromBase64String($b64))
+Get-FileHash .\EventideSharedProfiles-v0.9.0-alpha.3.zip -Algorithm SHA256
+Expand-Archive .\EventideSharedProfiles-v0.9.0-alpha.3.zip -DestinationPath .\alpha3
+```
 
-Deleting a previously synchronized custom quality profile no longer replaces or erases its NAS record. Eventide keeps the complete quality payload and increments the record revision while setting `is_deleted: true`. Other connected clients remove the corresponding Eventide-managed Cura containers, and stale clients cannot silently overwrite the deletion. If recovery is needed, changing only `is_deleted` back to `false` in the shared JSON causes Eventide to reinstall that same profile identity on the next sync. A newly-created Cura profile may still reuse the same visible name and receives a new Eventide quality ID.
+The SHA-256 **must** be:
 
-If deletion races with an independent edit, Eventide does not guess. The conflict offers **Accept Deletion**, **Keep as New Profile**, and **Restore Profile**. If the deleting PC discovers that the shared copy was edited first, it must explicitly choose whether to delete that newer edit or restore it locally.
+`e87b8c98e7c89fa0457ba89dadfe5b6094816fe7bb3dc05cac0df300c5bf6a03`
 
-Every newly written shared JSON record and the manifest include `publisher_plugin_version`. If a client encounters data published by a newer Eventide plugin, it refuses to overwrite that data and reports **PLUGIN UPDATE REQUIRED**. Older unstamped records remain readable.
+## Exact extracted source Git blob hashes
 
-## Still not finished
+These hashes are from the files inside the canonical alpha.3 ZIP. They can be used to verify that no source file has changed after extraction.
 
-- syncing third-party custom machine `.def.json` files that are absent on the target Cura
-- final G-code hard-limit/PA stamping for multi-extruder slices
-- polished public installer / Cura Marketplace packaging
+| File | Git blob SHA-1 |
+| --- | --- |
+| `EventideSharedProfiles/CHANGELOG.md` | `81b9199e365a9f23c5f6e579615ebb28f15b1418` |
+| `EventideSharedProfiles/EventideLibraryMonitor.py` | `da1d2207dde040dcb5e6fc5b8e99fa4ca430ddcd` |
+| `EventideSharedProfiles/EventidePreferences.py` | `e9b1cfc2f67917b939983b0e8acb5c9716710d01` |
+| `EventideSharedProfiles/EventideSharedProfiles.py` | `74c86d65b51f81a9f2ef1961149eb62da327b291` |
+| `EventideSharedProfiles/EventideStorage.py` | `3bcc9e16f7661614d321f095201640f6d6c0306d` |
+| `EventideSharedProfiles/README.md` | `64963a9e21f92178746086aaeb7c9f86cd6372a5` |
+| `EventideSharedProfiles/TESTING.md` | `6eb14c3689472547a63616d9a776a2956d923066` |
+| `EventideSharedProfiles/__init__.py` | `54e13f2f6f7e574e13472ea18e114f4b42e0e3c2` |
+| `EventideSharedProfiles/plugin.json` | `3a84591ac4626d79acee81c7277c512aec01ff4d` |
+| `EventideSharedProfiles/qml/EventideQualityConflictDialog.qml` | `bfe407355b958d800664348712e55037f21f6281` |
+| `EventideSharedProfiles/qml/EventideSharedProfilesWindow.qml` | `eb0b9fa1e3a0a5c1875740b4ed4518e7e77cd219` |
 
-## Beta testing
+## Pressure Advance state in alpha.3
 
-See `TESTING.md`. Please use **Advanced → Export diagnostics** when filing a bug. The diagnostics report includes local machine/path information, so review it before sharing publicly.
+Pressure Advance was **intentionally removed from the active alpha.3 capability model/UI**, inherited from the v0.9.0-alpha.2 refactor. It was not accidentally omitted from QML.
+
+The alpha.2 changelog states that final G-code parsing/rewrite and Klipper pressure-advance command injection were removed, while capability limits continue to apply through transient CuraEngine settings before slicing.
+
+In `EventideSharedProfiles.py`, `saveCurrentCapability()` explicitly removes legacy keys on save:
+
+```python
+tuning.pop("pressure_advance", None)
+tuning.pop("emit_klipper_pressure_advance", None)
+```
+
+The active alpha.3 capability creation, editor-loading, and slice-time application paths do not create or consume Pressure Advance. There is no `SET_PRESSURE_ADVANCE` emission path in this checkpoint.
+
+The later calibration requirement **Pressure Advance = 0.055 for Trident + ELEGOO PLA Pro Peach Pink** is intentionally *not* written into this archive, because doing so would alter alpha.3.
