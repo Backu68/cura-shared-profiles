@@ -1,0 +1,26 @@
+name: Apply alpha5 PA cache fix
+
+on:
+  push:
+    branches:
+      - work/0.9.0-alpha.5
+    paths:
+      - .alpha5-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply alpha5 patch
+        run: python tools/apply_alpha5.py
+      - name: Commit alpha5 source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add EventideSharedProfiles/EventideSharedProfiles.py EventideSharedProfiles/plugin.json EventideSharedProfiles/CHANGELOG.md
+          git commit -m "Fix Pressure Advance injection in v0.9.0-alpha.5"
+          git push
