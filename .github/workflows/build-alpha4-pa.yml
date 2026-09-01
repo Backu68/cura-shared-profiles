@@ -1,0 +1,201 @@
+name: Build alpha4 pressure advance
+
+on:
+  push:
+    branches:
+      - work/0.9.0-alpha.4
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: work/0.9.0-alpha.4
+          fetch-depth: 0
+
+      - name: Apply alpha4 PA changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          py_path = Path('EventideSharedProfiles/EventideSharedProfiles.py')
+          qml_path = Path('EventideSharedProfiles/qml/EventideSharedProfilesWindow.qml')
+          plugin_path = Path('EventideSharedProfiles/plugin.json')
+          changelog_path = Path('EventideSharedProfiles/CHANGELOG.md')
+
+          py = py_path.read_text(encoding='utf-8')
+          qml = qml_path.read_text(encoding='utf-8')
+          plugin = plugin_path.read_text(encoding='utf-8')
+          changelog = changelog_path.read_text(encoding='utf-8')
+
+          def replace_exact(text, old, new, expected=1, label='replacement'):
+              count = text.count(old)
+              if count != expected:
+                  raise SystemExit(f'{label}: expected {expected} occurrence(s), found {count}')
+              return text.replace(old, new)
+
+          py = replace_exact(
+              py,
+              '    PLUGIN_VERSION = "0.9.0-alpha.3"\n    PUBLISHER_PLUGIN_VERSION = "0.9.0-alpha.3"',
+              '    PLUGIN_VERSION = "0.9.0-alpha.4"\n    PUBLISHER_PLUGIN_VERSION = "0.9.0-alpha.4"',
+              label='python version',
+          )
+
+          py = replace_exact(
+              py,
+              '        self._capability_max_linear_speed = ""\n        self._capability_flow_percent = ""',
+              '        self._capability_max_linear_speed = ""\n        self._capability_pressure_advance = ""\n        self._capability_emit_klipper_pa = False\n        self._capability_flow_percent = ""',
+              expected=2,
+              label='capability editor state',
+          )
+
+          py = replace_exact(
+              py,
+              '''        self._capability_max_linear_speed = self._display_number(\n            limits.get("max_linear_speed_mm_s")\n        )\n        self._capability_flow_percent = self._display_number(\n            tuning.get("flow_percent")\n        )''',
+              '''        self._capability_max_linear_speed = self._display_number(\n            limits.get("max_linear_speed_mm_s")\n        )\n        self._capability_pressure_advance = self._display_number(\n            tuning.get("pressure_advance")\n        )\n        self._capability_emit_klipper_pa = bool(\n            tuning.get("emit_klipper_pressure_advance", False)\n        )\n        self._capability_flow_percent = self._display_number(\n            tuning.get("flow_percent")\n        )''',
+              label='load PA editor state',
+          )
+
+          py = replace_exact(
+              py,
+              '''            "tuning": {\n                "flow_percent": None,\n                "temperature_offset_c": None,''',
+              '''            "tuning": {\n                "pressure_advance": None,\n                "emit_klipper_pressure_advance": False,\n                "flow_percent": None,\n                "temperature_offset_c": None,''',
+              label='new capability PA fields',
+          )
+
+          py = replace_exact(
+              py,
+              '''            # 0.9.0 no longer injects firmware commands into finished G-code.\n            # Drop obsolete beta-only PA emission fields when this record is saved.\n            tuning.pop("pressure_advance", None)\n            tuning.pop("emit_klipper_pressure_advance", None)\n            tuning["flow_percent"] = self._optional_float(''',
+              '''            pressure_advance = self._optional_float(\n                payload.get("pressure_advance"),\n                "Pressure advance",\n                minimum=0.0,\n            )\n            emit_klipper_pa = bool(\n                payload.get("emit_klipper_pressure_advance", False)\n            )\n            if emit_klipper_pa and pressure_advance is None:\n                raise ValueError(\n                    "Pressure advance must be set when Klipper PA emission is enabled"\n                )\n            tuning["pressure_advance"] = pressure_advance\n            tuning["emit_klipper_pressure_advance"] = emit_klipper_pa\n            tuning["flow_percent"] = self._optional_float(''',
+              label='save PA fields',
+          )
+
+          helper_marker = '''        return values, changed\n\n    def _transform_slice_settings(\n'''
+          helper_code = '''        return values, changed\n\n    def _apply_klipper_pa_to_global_slice_values(\n        self,\n        settings: Dict[str, Any],\n    ) -> Tuple[Dict[str, Any], str]:\n        \"\"\"Add a material capability PA command to Cura's copied start G-code.\n\n        This operates only on StartSliceJob's transient replacement-token copy.\n        Eventide does not mutate Cura's live machine stack and does not rewrite\n        finished G-code. Alpha.4 intentionally limits firmware PA emission to a\n        single enabled extruder because a generic Cura profile does not provide a\n        reliable mapping to arbitrary Klipper EXTRUDER config names.\n        \"\"\"\n        values = dict(settings)\n        if not self._shared_library_path:\n            return values, \"\"\n\n        root = os.path.normpath(self._shared_library_path)\n        if not os.path.isfile(self._manifest_path(root)):\n            return values, \"\"\n\n        global_stack = self._application.getGlobalContainerStack()\n        if global_stack is None:\n            return values, \"Klipper PA not emitted: no active printer stack\"\n\n        enabled_extruders = [\n            extruder\n            for extruder in list(getattr(global_stack, \"extruderList\", []) or [])\n            if bool(getattr(extruder, \"isEnabled\", True))\n        ]\n        if len(enabled_extruders) != 1:\n            return values, (\n                \"Klipper PA not emitted: requires exactly one enabled extruder\"\n            )\n\n        extruder_stack = enabled_extruders[0]\n        effective_settings: Dict[str, Any] = {}\n        try:\n            keys = extruder_stack.getAllKeys()\n        except (AttributeError, TypeError):\n            keys = []\n        for key in keys:\n            try:\n                effective_settings[str(key)] = extruder_stack.getProperty(\n                    key, \"value\"\n                )\n            except Exception:\n                Logger.logException(\n                    \"w\",\n                    \"Eventide could not read extruder setting %s while resolving Klipper PA\",\n                    key,\n                )\n\n        try:\n            record, context = self._find_capability_for_slice_stack(\n                root,\n                extruder_stack,\n                effective_settings,\n            )\n        except FileNotFoundError:\n            return values, \"\"\n        except Exception as error:\n            Logger.logException(\n                \"e\", \"Eventide Klipper PA slice resolution failed\"\n            )\n            return values, \"Klipper PA not emitted: {}\".format(error)\n\n        tuning = record.get(\"tuning\", {})\n        if not bool(tuning.get(\"emit_klipper_pressure_advance\", False)):\n            return values, \"\"\n\n        pressure_advance = tuning.get(\"pressure_advance\")\n        if pressure_advance in (None, \"\"):\n            return values, \"Klipper PA not emitted: enabled but value is unset\"\n\n        try:\n            pressure_advance = float(pressure_advance)\n        except (TypeError, ValueError):\n            return values, \"Klipper PA not emitted: invalid value\"\n        if pressure_advance < 0:\n            return values, \"Klipper PA not emitted: value must be at least 0\"\n\n        if \"machine_start_gcode\" not in values:\n            return values, \"Klipper PA not emitted: machine_start_gcode unavailable\"\n\n        start_gcode = str(values.get(\"machine_start_gcode\", \"\") or \"\")\n        command = (\n            \"SET_PRESSURE_ADVANCE ADVANCE={:g} ; Eventide Shared Profiles\"\n        ).format(pressure_advance)\n        separator = (\n            \"\"\n            if not start_gcode or start_gcode.endswith((\"\\n\", \"\\r\"))\n            else \"\\n\"\n        )\n        values[\"machine_start_gcode\"] = start_gcode + separator + command\n        return values, \"Klipper PA={:g} ({})\".format(\n            pressure_advance,\n            context.get(\"material_name\", \"material\"),\n        )\n\n    def _transform_slice_settings(\n'''
+          py = replace_exact(py, helper_marker, helper_code, label='PA global helper')
+
+          py = replace_exact(
+              py,
+              '''        if getattr(stack, "material", None) is None:\n            self._slice_capability_snapshots = {}\n            self._last_slice_resolution = "Slice started; resolving Eventide capabilities per extruder."\n            return original_values''',
+              '''        if getattr(stack, "material", None) is None:\n            self._slice_capability_snapshots = {}\n            transformed, pa_note = self._apply_klipper_pa_to_global_slice_values(\n                original_values\n            )\n            self._last_slice_resolution = (\n                "Slice started; resolving Eventide capabilities per extruder."\n                + ((" " + pa_note) if pa_note else "")\n            )\n            return transformed''',
+              label='global PA hook',
+          )
+
+          py = replace_exact(
+              py,
+              '''    @pyqtProperty(str, notify=stateChanged)\n    def capabilityFlowPercent(self) -> str:\n        return self._capability_flow_percent\n''',
+              '''    @pyqtProperty(str, notify=stateChanged)\n    def capabilityPressureAdvance(self) -> str:\n        return self._capability_pressure_advance\n\n    @pyqtProperty(bool, notify=stateChanged)\n    def capabilityEmitKlipperPA(self) -> bool:\n        return self._capability_emit_klipper_pa\n\n    @pyqtProperty(str, notify=stateChanged)\n    def capabilityFlowPercent(self) -> str:\n        return self._capability_flow_percent\n''',
+              label='PA QML properties',
+          )
+
+          py = replace_exact(
+              py,
+              '''                hotend = record.get("hotend", {})\n                if hotend.get("nozzle_diameter_mm") in (None, ""):\n                    warnings.append("{}: nozzle diameter unset".format(name))\n''',
+              '''                hotend = record.get("hotend", {})\n                if hotend.get("nozzle_diameter_mm") in (None, ""):\n                    warnings.append("{}: nozzle diameter unset".format(name))\n                tuning = record.get("tuning", {})\n                if (\n                    tuning.get("emit_klipper_pressure_advance")\n                    and tuning.get("pressure_advance") in (None, "")\n                ):\n                    warnings.append(\n                        "{}: Klipper PA emit enabled but PA is unset".format(name)\n                    )\n''',
+              label='PA validation',
+          )
+
+          qml = replace_exact(
+              qml,
+              '''        materialFlow.text = eventideBridge.capabilityFlowPercent\n        tempOffset.text = eventideBridge.capabilityTemperatureOffset''',
+              '''        materialFlow.text = eventideBridge.capabilityFlowPercent\n        pressureAdvance.text = eventideBridge.capabilityPressureAdvance\n        klipperPa.checked = eventideBridge.capabilityEmitKlipperPA\n        tempOffset.text = eventideBridge.capabilityTemperatureOffset''',
+              label='QML populate PA',
+          )
+
+          qml = replace_exact(
+              qml,
+              '''            "flow_percent": materialFlow.text,\n            "temperature_offset_c": tempOffset.text,''',
+              '''            "flow_percent": materialFlow.text,\n            "pressure_advance": pressureAdvance.text,\n            "emit_klipper_pressure_advance": klipperPa.checked,\n            "temperature_offset_c": tempOffset.text,''',
+              label='QML save PA',
+          )
+
+          qml = replace_exact(
+              qml,
+              '''                                    Label { text: "Material flow (%)"; color: UM.Theme.getColor("text") }\n                                    TextField { id: materialFlow; Layout.fillWidth: true; placeholderText: "inherit Cura"; selectByMouse: true }\n\n''',
+              '''                                    Label { text: "Material flow (%)"; color: UM.Theme.getColor("text") }\n                                    TextField { id: materialFlow; Layout.fillWidth: true; placeholderText: "inherit Cura"; selectByMouse: true }\n\n                                    Label { text: "Pressure advance"; color: UM.Theme.getColor("text") }\n                                    TextField { id: pressureAdvance; Layout.fillWidth: true; placeholderText: "unset"; selectByMouse: true }\n\n                                    Label { text: "Klipper pressure advance"; color: UM.Theme.getColor("text") }\n                                    CheckBox { id: klipperPa; text: "Emit SET_PRESSURE_ADVANCE" }\n\n''',
+              label='QML PA controls',
+          )
+
+          plugin = replace_exact(
+              plugin,
+              '"version": "0.9.0-alpha.3"',
+              '"version": "0.9.0-alpha.4"',
+              label='plugin version',
+          )
+
+          changelog = replace_exact(
+              changelog,
+              '# Changelog\n\n## 0.9.0-alpha.3',
+              '''# Changelog\n\n## 0.9.0-alpha.4\n\n- Restored Pressure Advance as a printer/material/nozzle capability field.\n- Added an explicit Klipper PA emission toggle to the Capability UI.\n- Emits `SET_PRESSURE_ADVANCE` through CuraEngine's transient copied `machine_start_gcode` value before slicing; live Cura stacks and finished G-code are not rewritten.\n- Limits automatic Klipper PA emission to exactly one enabled extruder until an explicit Cura-to-Klipper extruder-name mapping exists.\n- Validates that PA is present when Klipper PA emission is enabled.\n\n## 0.9.0-alpha.3''',
+              label='changelog alpha4',
+          )
+
+          py_path.write_text(py, encoding='utf-8')
+          qml_path.write_text(qml, encoding='utf-8')
+          plugin_path.write_text(plugin, encoding='utf-8')
+          changelog_path.write_text(changelog, encoding='utf-8')
+          PY
+
+      - name: Static checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile EventideSharedProfiles/*.py
+          python - <<'PY'
+          from pathlib import Path
+          import json
+
+          py = Path('EventideSharedProfiles/EventideSharedProfiles.py').read_text(encoding='utf-8')
+          qml = Path('EventideSharedProfiles/qml/EventideSharedProfilesWindow.qml').read_text(encoding='utf-8')
+          plugin = json.loads(Path('EventideSharedProfiles/plugin.json').read_text(encoding='utf-8'))
+
+          checks = {
+              'plugin version': plugin.get('version') == '0.9.0-alpha.4',
+              'python version': 'PLUGIN_VERSION = "0.9.0-alpha.4"' in py,
+              'PA stored': 'tuning["pressure_advance"] = pressure_advance' in py,
+              'PA not stripped': 'tuning.pop("pressure_advance", None)' not in py,
+              'PA start injection': 'SET_PRESSURE_ADVANCE ADVANCE={:g} ; Eventide Shared Profiles' in py,
+              'no final-gcode parser': '_last_gcode_guardrail_summary' not in py,
+              'QML PA field': 'id: pressureAdvance' in qml,
+              'QML PA toggle': 'id: klipperPa' in qml,
+          }
+          failed = [name for name, passed in checks.items() if not passed]
+          if failed:
+              raise SystemExit('Static checks failed: ' + ', '.join(failed))
+          print('Static checks passed:', ', '.join(checks))
+          PY
+
+      - name: Package alpha4 ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f EventideSharedProfiles-v0.9.0-alpha.4.zip
+          zip -qr EventideSharedProfiles-v0.9.0-alpha.4.zip EventideSharedProfiles \
+            -x '*/__pycache__/*' '*.pyc'
+          sha256sum EventideSharedProfiles-v0.9.0-alpha.4.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EventideSharedProfiles-v0.9.0-alpha.4
+          path: EventideSharedProfiles-v0.9.0-alpha.4.zip
+          if-no-files-found: error
+
+      - name: Commit alpha4 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/build-alpha4-pa.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A EventideSharedProfiles .github || true
+          git commit -m 'Add pressure advance capability in v0.9.0-alpha.4'
+          git push origin HEAD:work/0.9.0-alpha.4
