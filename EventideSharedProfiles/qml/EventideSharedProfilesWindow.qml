@@ -22,6 +22,8 @@ Window {
         maxFlow.text = eventideBridge.capabilityMaxVolumetricFlow
         maxSpeed.text = eventideBridge.capabilityMaxLinearSpeed
         materialFlow.text = eventideBridge.capabilityFlowPercent
+        pressureAdvance.text = eventideBridge.capabilityPressureAdvance
+        klipperPa.checked = eventideBridge.capabilityEmitKlipperPA
         tempOffset.text = eventideBridge.capabilityTemperatureOffset
         retractDistance.text = eventideBridge.capabilityRetractionDistance
         retractSpeed.text = eventideBridge.capabilityRetractionSpeed
@@ -47,6 +49,8 @@ Window {
             "max_volumetric_flow_mm3_s": maxFlow.text,
             "max_linear_speed_mm_s": maxSpeed.text,
             "flow_percent": materialFlow.text,
+            "pressure_advance": pressureAdvance.text,
+            "emit_klipper_pressure_advance": klipperPa.checked,
             "temperature_offset_c": tempOffset.text,
             "retraction_distance_mm": retractDistance.text,
             "retraction_speed_mm_s": retractSpeed.text,
@@ -527,6 +531,12 @@ Window {
 
                                     Label { text: "Material flow (%)"; color: UM.Theme.getColor("text") }
                                     TextField { id: materialFlow; Layout.fillWidth: true; placeholderText: "inherit Cura"; selectByMouse: true }
+
+                                    Label { text: "Pressure advance"; color: UM.Theme.getColor("text") }
+                                    TextField { id: pressureAdvance; Layout.fillWidth: true; placeholderText: "unset"; selectByMouse: true }
+
+                                    Label { text: "Klipper pressure advance"; color: UM.Theme.getColor("text") }
+                                    CheckBox { id: klipperPa; text: "Emit SET_PRESSURE_ADVANCE" }
 
                                 }
                             }

@@ -32,8 +32,8 @@ class EventideSharedProfiles(QObject, Extension):
 
     stateChanged = pyqtSignal()
 
-    PLUGIN_VERSION = "0.9.0-alpha.3"
-    PUBLISHER_PLUGIN_VERSION = "0.9.0-alpha.3"
+    PLUGIN_VERSION = "0.9.0-alpha.4"
+    PUBLISHER_PLUGIN_VERSION = "0.9.0-alpha.4"
     QUALITY_SCHEMA = "eventide.shared_profiles.quality"
     # Legacy 0.8.6 destructive tombstones are read-only compatibility input.
     # 0.8.7+ uses QUALITY_SCHEMA with is_deleted=true so the full payload survives.
@@ -71,6 +71,8 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_revision = 0
         self._capability_max_volumetric_flow = ""
         self._capability_max_linear_speed = ""
+        self._capability_pressure_advance = ""
+        self._capability_emit_klipper_pa = False
         self._capability_flow_percent = ""
         self._capability_temperature_offset = ""
         self._capability_retraction_distance = ""
@@ -411,6 +413,8 @@ class EventideSharedProfiles(QObject, Extension):
             "hotend": {"nozzle_diameter_mm": None, "nozzle_material": None},
             "limits": {"max_volumetric_flow_mm3_s": None, "max_linear_speed_mm_s": None},
             "tuning": {
+                "pressure_advance": None,
+                "emit_klipper_pressure_advance": False,
                 "flow_percent": None,
                 "temperature_offset_c": None,
                 "retraction_distance_mm": None,
@@ -594,6 +598,8 @@ class EventideSharedProfiles(QObject, Extension):
         self._capability_revision = 0
         self._capability_max_volumetric_flow = ""
         self._capability_max_linear_speed = ""
+        self._capability_pressure_advance = ""
+        self._capability_emit_klipper_pa = False
         self._capability_flow_percent = ""
         self._capability_temperature_offset = ""
         self._capability_retraction_distance = ""
@@ -619,6 +625,12 @@ class EventideSharedProfiles(QObject, Extension):
         )
         self._capability_max_linear_speed = self._display_number(
             limits.get("max_linear_speed_mm_s")
+        )
+        self._capability_pressure_advance = self._display_number(
+            tuning.get("pressure_advance")
+        )
+        self._capability_emit_klipper_pa = bool(
+            tuning.get("emit_klipper_pressure_advance", False)
         )
         self._capability_flow_percent = self._display_number(
             tuning.get("flow_percent")
@@ -785,6 +797,8 @@ class EventideSharedProfiles(QObject, Extension):
                 "max_linear_speed_mm_s": None,
             },
             "tuning": {
+                "pressure_advance": None,
+                "emit_klipper_pressure_advance": False,
                 "flow_percent": None,
                 "temperature_offset_c": None,
                 "retraction_distance_mm": None,
@@ -1105,6 +1119,90 @@ class EventideSharedProfiles(QObject, Extension):
 
         return values, changed
 
+    def _apply_klipper_pa_to_global_slice_values(
+        self,
+        settings: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        """Add capability PA to Cura's transient copied machine start G-code.
+
+        This runs inside the existing StartSliceJob copied-settings hook. It does
+        not mutate Cura's live stack and does not rewrite finished G-code. Alpha.4
+        deliberately supports exactly one enabled extruder until Eventide has an
+        explicit Cura-to-Klipper extruder-name mapping.
+        """
+        values = dict(settings)
+        if not self._shared_library_path:
+            return values, ""
+
+        root = os.path.normpath(self._shared_library_path)
+        if not os.path.isfile(self._manifest_path(root)):
+            return values, ""
+
+        global_stack = self._application.getGlobalContainerStack()
+        if global_stack is None:
+            return values, "Klipper PA not emitted: no active printer stack"
+
+        enabled_extruders = [
+            extruder
+            for extruder in list(getattr(global_stack, "extruderList", []) or [])
+            if bool(getattr(extruder, "isEnabled", True))
+        ]
+        if len(enabled_extruders) != 1:
+            return values, "Klipper PA not emitted: requires exactly one enabled extruder"
+
+        extruder_stack = enabled_extruders[0]
+        effective_settings: Dict[str, Any] = {}
+        try:
+            keys = extruder_stack.getAllKeys()
+        except (AttributeError, TypeError):
+            keys = []
+        for key in keys:
+            try:
+                effective_settings[str(key)] = extruder_stack.getProperty(key, "value")
+            except Exception:
+                Logger.logException(
+                    "w",
+                    "Eventide could not read extruder setting %s while resolving Klipper PA",
+                    key,
+                )
+
+        try:
+            record, context = self._find_capability_for_slice_stack(
+                root, extruder_stack, effective_settings
+            )
+        except FileNotFoundError:
+            return values, ""
+        except Exception as error:
+            Logger.logException("e", "Eventide Klipper PA slice resolution failed")
+            return values, "Klipper PA not emitted: {}".format(error)
+
+        tuning = record.get("tuning", {})
+        if not bool(tuning.get("emit_klipper_pressure_advance", False)):
+            return values, ""
+
+        pressure_advance = tuning.get("pressure_advance")
+        if pressure_advance in (None, ""):
+            return values, "Klipper PA not emitted: enabled but value is unset"
+        try:
+            pressure_advance = float(pressure_advance)
+        except (TypeError, ValueError):
+            return values, "Klipper PA not emitted: invalid value"
+        if pressure_advance < 0:
+            return values, "Klipper PA not emitted: value must be at least 0"
+
+        if "machine_start_gcode" not in values:
+            return values, "Klipper PA not emitted: machine_start_gcode unavailable"
+
+        start_gcode = str(values.get("machine_start_gcode", "") or "")
+        command = "SET_PRESSURE_ADVANCE ADVANCE={:g} ; Eventide Shared Profiles".format(
+            pressure_advance
+        )
+        separator = "" if not start_gcode or start_gcode.endswith(("\n", "\r")) else "\n"
+        values["machine_start_gcode"] = start_gcode + separator + command
+        return values, "Klipper PA={:g} ({})".format(
+            pressure_advance, context.get("material_name", "material")
+        )
+
     def _transform_slice_settings(
         self,
         stack: Any,
@@ -1116,8 +1214,14 @@ class EventideSharedProfiles(QObject, Extension):
         # ever leaking into a later slice.
         if getattr(stack, "material", None) is None:
             self._slice_capability_snapshots = {}
-            self._last_slice_resolution = "Slice started; resolving Eventide capabilities per extruder."
-            return original_values
+            transformed, pa_note = self._apply_klipper_pa_to_global_slice_values(
+                original_values
+            )
+            self._last_slice_resolution = (
+                "Slice started; resolving Eventide capabilities per extruder."
+                + ((" " + pa_note) if pa_note else "")
+            )
+            return transformed
 
         if not self._shared_library_path:
             return original_values
@@ -3132,6 +3236,14 @@ class EventideSharedProfiles(QObject, Extension):
                 hotend = record.get("hotend", {})
                 if hotend.get("nozzle_diameter_mm") in (None, ""):
                     warnings.append("{}: nozzle diameter unset".format(name))
+                tuning = record.get("tuning", {})
+                if (
+                    tuning.get("emit_klipper_pressure_advance")
+                    and tuning.get("pressure_advance") in (None, "")
+                ):
+                    warnings.append(
+                        "{}: Klipper PA emit enabled but PA is unset".format(name)
+                    )
 
             self._refresh_library_state_internal(require_manifest=True)
             if errors:
@@ -3640,10 +3752,20 @@ class EventideSharedProfiles(QObject, Extension):
                 strictly_positive=True,
             )
 
-            # 0.9.0 no longer injects firmware commands into finished G-code.
-            # Drop obsolete beta-only PA emission fields when this record is saved.
-            tuning.pop("pressure_advance", None)
-            tuning.pop("emit_klipper_pressure_advance", None)
+            pressure_advance = self._optional_float(
+                payload.get("pressure_advance"),
+                "Pressure advance",
+                minimum=0.0,
+            )
+            emit_klipper_pa = bool(
+                payload.get("emit_klipper_pressure_advance", False)
+            )
+            if emit_klipper_pa and pressure_advance is None:
+                raise ValueError(
+                    "Pressure advance must be set when Klipper PA emission is enabled"
+                )
+            tuning["pressure_advance"] = pressure_advance
+            tuning["emit_klipper_pressure_advance"] = emit_klipper_pa
             tuning["flow_percent"] = self._optional_float(
                 payload.get("flow_percent"),
                 "Material flow",
@@ -4129,6 +4251,14 @@ class EventideSharedProfiles(QObject, Extension):
     @pyqtProperty(str, notify=stateChanged)
     def capabilityMaxLinearSpeed(self) -> str:
         return self._capability_max_linear_speed
+
+    @pyqtProperty(str, notify=stateChanged)
+    def capabilityPressureAdvance(self) -> str:
+        return self._capability_pressure_advance
+
+    @pyqtProperty(bool, notify=stateChanged)
+    def capabilityEmitKlipperPA(self) -> bool:
+        return self._capability_emit_klipper_pa
 
     @pyqtProperty(str, notify=stateChanged)
     def capabilityFlowPercent(self) -> str:

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0-alpha.4
+
+- Restored Pressure Advance as a printer/material/nozzle capability field.
+- Added an explicit Klipper PA emission toggle to the Capability UI.
+- Emits `SET_PRESSURE_ADVANCE` through CuraEngine's transient copied `machine_start_gcode` value before slicing; live Cura stacks and finished G-code are not rewritten.
+- Limits automatic Klipper PA emission to exactly one enabled extruder until an explicit Cura-to-Klipper extruder-name mapping exists.
+- Validates that PA is present when Klipper PA emission is enabled.
+
 ## 0.9.0-alpha.3
 
 - Changed the empty shared-library path placeholder to `\\path\\to\\share` so a remembered real path is visually distinct from the example state.
