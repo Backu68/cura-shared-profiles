@@ -1,0 +1,8 @@
+{
+    "name": "Eventide Shared Profiles",
+    "author": "Eventide Systems",
+    "version": "0.9.0-alpha.3",
+    "api": 8,
+    "description": "Shared Cura machines, materials, quality profiles, and printer/material capability management.",
+    "catalog": "cura"
+}
