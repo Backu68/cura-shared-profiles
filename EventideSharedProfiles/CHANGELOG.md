@@ -6,6 +6,8 @@
 - Reuse the already-resolved Eventide capability snapshot for PA instead of resolving the material a second time during the global-settings pass.
 - Keep PA slice-only: no live Cura stack mutation and no finished-G-code rewriting.
 - Extend slice diagnostics so successful or failed PA emission remains visible after extruder capability resolution.
+- Add automatic material-family exhaust policy emission: ASA/ABS slices inject `EVENTIDE_MATERIAL_POLICY EXHAUST_PURGE=1`; other/unknown material families inject `EXHAUST_PURGE=0` so stale printer policy cannot leak between prints.
+- Keep exhaust timing/hardware behavior in Klipper; Eventide communicates only the material policy at slice time.
 
 ## 0.9.0-alpha.4
 
