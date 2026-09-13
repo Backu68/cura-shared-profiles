@@ -41,6 +41,7 @@ class EventideSharedProfiles(QObject, Extension):
     LIBRARY_FORMAT = 1
     RECORD_FORMAT = 1
     LIBRARY_POLL_INTERVAL_MS = 10000
+    EXHAUST_PURGE_MATERIALS = frozenset({"ABS", "ASA"})
 
     def __init__(self) -> None:
         QObject.__init__(self, None)
@@ -1201,6 +1202,77 @@ class EventideSharedProfiles(QObject, Extension):
         material_name = str(snapshot.get("material_name", "material") or "material")
         return "Klipper PA={:g} ({})".format(pressure_advance, material_name)
 
+    def _apply_material_policy_to_cached_slice_settings(self, job_self: Any) -> str:
+        """Emit printer policy from Cura's resolved material family.
+
+        This stays slice-only like PA: Eventide changes only Cura's copied
+        ``machine_start_gcode`` cache. Klipper owns the hardware behavior and
+        timing; Eventide only communicates whether the selected material wants
+        an end-of-print chamber exhaust purge.
+        """
+        cached = getattr(job_self, "_all_extruders_settings", None)
+        if not isinstance(cached, dict):
+            return "Material policy not emitted: Cura settings cache unavailable"
+
+        global_values = cached.get("-1")
+        if not isinstance(global_values, dict):
+            return "Material policy not emitted: global settings cache unavailable"
+
+        global_stack = self._application.getGlobalContainerStack()
+        if global_stack is None:
+            return "Material policy not emitted: no active printer stack"
+
+        enabled_extruders = [
+            extruder
+            for extruder in list(getattr(global_stack, "extruderList", []) or [])
+            if bool(getattr(extruder, "isEnabled", True))
+        ]
+        if len(enabled_extruders) != 1:
+            return "Material policy not emitted: requires exactly one enabled extruder"
+
+        extruder_stack = enabled_extruders[0]
+        material = getattr(extruder_stack, "material", None)
+        material_name = "material"
+        material_family = ""
+        if material is not None:
+            try:
+                material_name = str(material.getName() or "material")
+            except Exception:
+                material_name = "material"
+            try:
+                material_family = str(
+                    material.getMetaDataEntry("material", "") or ""
+                ).strip().upper()
+            except Exception:
+                material_family = ""
+
+        exhaust_purge = 1 if material_family in self.EXHAUST_PURGE_MATERIALS else 0
+
+        if "machine_start_gcode" not in global_values:
+            return "Material policy not emitted: machine_start_gcode unavailable"
+
+        start_gcode = str(global_values.get("machine_start_gcode", "") or "")
+        command = (
+            "EVENTIDE_MATERIAL_POLICY EXHAUST_PURGE={} ; Eventide Shared Profiles"
+        ).format(exhaust_purge)
+
+        # Always emit an explicit 0 or 1 so a prior material policy can never
+        # leak into the next print through Klipper's persistent macro variable.
+        if command not in start_gcode.splitlines():
+            separator = (
+                ""
+                if not start_gcode or start_gcode.endswith(("\n", "\r"))
+                else "\n"
+            )
+            global_values["machine_start_gcode"] = start_gcode + separator + command
+
+        family_label = material_family or "UNKNOWN"
+        return "Exhaust purge={} ({} / {})".format(
+            "on" if exhaust_purge else "off",
+            family_label,
+            material_name,
+        )
+
     def _transform_slice_settings(
         self,
         stack: Any,
@@ -1330,10 +1402,10 @@ class EventideSharedProfiles(QObject, Extension):
 
             target_class._buildReplacementTokens = eventide_build_replacement_tokens
 
-        # Alpha.5 PA hook: Cura's cache builder first invokes the transformed
+        # Alpha.5 cache hook: Cura's cache builder first invokes the transformed
         # global/extruder token hooks above, which resolves and snapshots the
         # material capability. Only after that complete cache exists do we
-        # append PA to the copied machine_start_gcode value.
+        # append material policy + PA to the copied machine_start_gcode value.
         if not hasattr(target_class, "_eventide_original_cacheAllExtruderSettings"):
             original_cache = target_class._cacheAllExtruderSettings
             target_class._eventide_original_cacheAllExtruderSettings = original_cache
@@ -1343,13 +1415,16 @@ class EventideSharedProfiles(QObject, Extension):
                 owner = getattr(target_class, "_eventide_owner", None)
                 if owner is None:
                     return
+                policy_note = owner._apply_material_policy_to_cached_slice_settings(job_self)
                 pa_note = owner._apply_klipper_pa_to_cached_slice_settings(job_self)
-                if pa_note:
+                for note in (policy_note, pa_note):
+                    if not note:
+                        continue
                     if owner._last_slice_resolution:
-                        owner._last_slice_resolution += " | " + pa_note
+                        owner._last_slice_resolution += " | " + note
                     else:
-                        owner._last_slice_resolution = pa_note
-                    Logger.log("i", "Eventide %s", pa_note)
+                        owner._last_slice_resolution = note
+                    Logger.log("i", "Eventide %s", note)
 
             target_class._cacheAllExtruderSettings = eventide_cache_all_extruder_settings
 
@@ -1358,7 +1433,7 @@ class EventideSharedProfiles(QObject, Extension):
         self.stateChanged.emit()
         Logger.log(
             "i",
-            "Eventide installed transient StartSliceJob settings + PA cache hooks",
+            "Eventide installed transient StartSliceJob settings + material-policy/PA cache hooks",
         )
         return True
 
