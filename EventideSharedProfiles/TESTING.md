@@ -17,6 +17,9 @@ These tests are in addition to the existing synchronization/deletion/conflict ma
 9. Repeat with a non-Marlin G-code flavor. Expected: capability resolution behaves the same because Eventide no longer parses firmware-specific finished G-code.
 10. Verify multi-extruder slicing: capability resolution remains per-extruder and no final G-code post-processing stage is attached.
 11. Leave the NAS/share idle for several monitor intervals. Expected: one Uranium Job at a time; no overlapping scan jobs and no 2.5-second UI-thread filesystem crawling.
+12. Slice with a material whose Cura metadata family is ASA or ABS. Expected: copied `machine_start_gcode` contains `EVENTIDE_MATERIAL_POLICY EXHAUST_PURGE=1`.
+13. Slice with PLA/PETG or an unknown material family immediately afterward. Expected: copied `machine_start_gcode` contains `EVENTIDE_MATERIAL_POLICY EXHAUST_PURGE=0`; the prior purge request cannot persist into the new print.
+14. Confirm the material-policy command is injected before CuraEngine runs, with no finished-G-code rewrite and no live Cura container mutation.
 
 
 ## A. Fresh install / connection
