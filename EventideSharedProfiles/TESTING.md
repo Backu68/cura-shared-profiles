@@ -21,6 +21,10 @@ These tests are in addition to the existing synchronization/deletion/conflict ma
 13. Slice with PLA/PETG or an unknown material family immediately afterward. Expected: copied `machine_start_gcode` contains `EVENTIDE_MATERIAL_POLICY EXHAUST_PURGE=0`; the prior purge request cannot persist into the new print.
 14. Confirm the material-policy command is injected before CuraEngine runs, with no finished-G-code rewrite and no live Cura container mutation.
 
+15. Material revision propagation: on PC1 change one or more values inside an already-shared writable custom material (for example printing temperature), then click **Share current setup**. On PC2, where that same material GUID is already installed with the older values, run Sync now or wait for live sync. Expected: Eventide updates the existing material in place, the changed values appear on PC2, and no duplicate material/GUID is created.
+16. Run Sync now again without changing that material on PC1. Expected: the material is reported as local/existing rather than updated again; the same shared XML is not repeatedly deserialized.
+17. Make a purely local material edit on PC2 without changing the shared material. Trigger an unrelated library change. Expected: the previously-applied shared hash prevents that unrelated change from rewriting the PC2-only edit. If PC1 later republishes a new material revision, the new shared revision becomes authoritative and is applied.
+
 
 ## A. Fresh install / connection
 
