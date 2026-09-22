@@ -8,6 +8,10 @@
 - Extend slice diagnostics so successful or failed PA emission remains visible after extruder capability resolution.
 - Add automatic material-family exhaust policy emission: ASA/ABS slices inject `EVENTIDE_MATERIAL_POLICY EXHAUST_PURGE=1`; other/unknown material families inject `EXHAUST_PURGE=0` so stale printer policy cannot leak between prints.
 - Keep exhaust timing/hardware behavior in Klipper; Eventide communicates only the material policy at slice time.
+- Fix shared custom-material revision propagation: an already-installed matching GUID is no longer treated as automatically current.
+- Update changed writable materials in place through Cura's XML material deserializer, preserving the existing GUID/container identity instead of importing a duplicate.
+- Persist the last applied shared material hash locally so unchanged material payloads are not repeatedly rewritten when unrelated library records change.
+- Extend sync status to distinguish newly installed, updated, and already-current materials.
 
 ## 0.9.0-alpha.4
 
