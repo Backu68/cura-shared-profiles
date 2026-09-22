@@ -103,6 +103,7 @@ class EventideSharedProfiles(QObject, Extension):
         self._last_quality_sync_summary = "No shared quality-profile activity yet."
         self._machine_bindings: Dict[str, str] = {}
         self._quality_sync_state: Dict[str, Dict[str, Any]] = {}
+        self._material_sync_state: Dict[str, Dict[str, Any]] = {}
         # Runtime conflict queue. Conflicts are rediscovered from local/shared
         # hashes after restart, so the queue itself does not need persistence.
         self._quality_conflicts: Dict[str, Dict[str, Any]] = {}
@@ -156,6 +157,7 @@ class EventideSharedProfiles(QObject, Extension):
         self._toolhead_bindings = data["toolhead_bindings"]
         self._machine_bindings = data["machine_bindings"]
         self._quality_sync_state = data["quality_sync_state"]
+        self._material_sync_state = data["material_sync_state"]
 
     def _save_config(self) -> None:
         self._preferences.save(
@@ -164,6 +166,7 @@ class EventideSharedProfiles(QObject, Extension):
             toolhead_bindings=self._toolhead_bindings,
             machine_bindings=self._machine_bindings,
             quality_sync_state=self._quality_sync_state,
+            material_sync_state=self._material_sync_state,
         )
 
     def _utc_now(self) -> str:
@@ -1708,29 +1711,139 @@ class EventideSharedProfiles(QObject, Extension):
         self.stateChanged.emit()
         return self._status
 
-    def _material_guid_exists_locally(self, guid: str) -> bool:
-        if not str(guid or "").strip():
-            return False
+    def _material_roots_for_guid(self, guid: str) -> List[Any]:
+        """Return unique logical root material containers for a Cura material GUID."""
+        guid = str(guid or "").strip()
+        if not guid:
+            return []
+
+        registry = CuraContainerRegistry.getInstance()
+        roots: List[Any] = []
+        seen_ids = set()
         try:
-            return bool(CuraContainerRegistry.getInstance().findInstanceContainersMetadata(GUID=str(guid).strip()))
+            matches = registry.findInstanceContainers(GUID=guid)
         except Exception:
-            return False
+            Logger.logException("w", "Eventide could not resolve local material GUID %s", guid)
+            return roots
+
+        for container in matches:
+            try:
+                container_id = str(container.getId() or "").strip()
+                base_file = str(
+                    container.getMetaDataEntry("base_file", container_id) or container_id
+                ).strip()
+                root_matches = registry.findInstanceContainers(id=base_file) if base_file else []
+                root = root_matches[0] if root_matches else container
+                root_id = str(root.getId() or "").strip()
+                if root_id and root_id not in seen_ids:
+                    seen_ids.add(root_id)
+                    roots.append(root)
+            except Exception:
+                Logger.logException("w", "Eventide could not resolve a root for material GUID %s", guid)
+        return roots
+
+    def _material_guid_exists_locally(self, guid: str) -> bool:
+        return bool(self._material_roots_for_guid(guid))
+
+    def _record_material_sync_state(
+        self,
+        record: Dict[str, Any],
+        guid: str,
+        shared_hash: str,
+    ) -> None:
+        key = str(record.get("id", "") or guid or "").strip()
+        if not key:
+            return
+        state = {
+            "sha256": str(shared_hash or "").strip(),
+            "guid": str(guid or "").strip(),
+            "revision": int(record.get("revision", 0) or 0),
+        }
+        if self._material_sync_state.get(key) != state:
+            self._material_sync_state[key] = state
+            self._save_config()
 
     def _install_material_record(self, record: Dict[str, Any]) -> str:
+        """Install or update one published custom material without changing its GUID."""
         definition = record.get("material_definition", {})
         if not isinstance(definition, dict):
             return "unpublished"
+
         guid = str(definition.get("guid", "") or "").strip()
-        if guid and self._material_guid_exists_locally(guid):
-            return "existing"
-        if bool(definition.get("readonly_builtin", False)):
-            return "builtin-missing"
+        readonly_builtin = bool(definition.get("readonly_builtin", False))
+        local_roots = self._material_roots_for_guid(guid) if guid else []
+
+        # Built-in Cura materials are identities only; Eventide never overwrites
+        # Cura's read-only bundled material definitions.
+        if readonly_builtin:
+            return "existing" if local_roots else "builtin-missing"
+
         serialized = str(definition.get("serialized", "") or "")
         if not serialized.strip():
-            return "unpublished"
+            return "existing" if local_roots else "unpublished"
+
+        shared_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         expected_hash = str(definition.get("sha256", "") or "").strip()
-        if expected_hash and hashlib.sha256(serialized.encode("utf-8")).hexdigest() != expected_hash:
+        if expected_hash and shared_hash != expected_hash:
             raise ValueError("material payload hash mismatch for {}".format(record.get("id", "")))
+        if expected_hash:
+            shared_hash = expected_hash
+
+        state_key = str(record.get("id", "") or guid or "").strip()
+        applied_hash = str(
+            self._material_sync_state.get(state_key, {}).get("sha256", "")
+            if state_key else ""
+        ).strip()
+
+        if local_roots:
+            if len(local_roots) != 1:
+                raise RuntimeError(
+                    "multiple local material roots share GUID {}; refusing ambiguous update".format(guid)
+                )
+
+            root = local_roots[0]
+            registry = CuraContainerRegistry.getInstance()
+            root_id = str(root.getId() or "").strip()
+            if registry.isReadOnly(root_id):
+                raise RuntimeError(
+                    "local material {} is read-only; refusing to overwrite it from shared data".format(
+                        root_id or guid
+                    )
+                )
+
+            # Once this exact shared payload has been applied, leave any later
+            # purely-local edits alone until the shared material itself changes.
+            if applied_hash and applied_hash == shared_hash:
+                return "existing"
+
+            # Upgrade path for clients that predate material-sync state: if their
+            # existing XML already equals the shared payload, record that baseline
+            # without needlessly deserializing it again.
+            try:
+                local_serialized = str(root.serialize() or "")
+                local_hash = hashlib.sha256(local_serialized.encode("utf-8")).hexdigest()
+            except Exception:
+                local_hash = ""
+            if local_hash == shared_hash:
+                self._record_material_sync_state(record, guid, shared_hash)
+                return "existing"
+
+            # Cura's XmlMaterialProfile.deserialize() preserves the existing root
+            # container id and refreshes already-loaded machine/hotend derivatives.
+            # This avoids the duplicate container identity that a normal import
+            # would create for a material GUID that already exists locally.
+            root.deserialize(serialized)
+            if guid:
+                updated_guid = str(root.getMetaDataEntry("GUID", "") or "").strip()
+                if updated_guid != guid:
+                    raise RuntimeError(
+                        "material update changed GUID unexpectedly: {} -> {}".format(
+                            guid, updated_guid or "<blank>"
+                        )
+                    )
+            root.setDirty(True)
+            self._record_material_sync_state(record, guid, shared_hash)
+            return "updated"
 
         from cura.Settings.ContainerManager import ContainerManager
         manager = ContainerManager.getInstance()
@@ -1763,6 +1876,7 @@ class EventideSharedProfiles(QObject, Extension):
 
         if guid and not self._material_guid_exists_locally(guid):
             raise RuntimeError("material import completed but GUID {} is still not registered".format(guid))
+        self._record_material_sync_state(record, guid, shared_hash)
         return "installed"
 
     def _find_local_machine_for_record(self, record: Dict[str, Any]) -> Optional[Any]:
@@ -3159,7 +3273,7 @@ class EventideSharedProfiles(QObject, Extension):
     @pyqtSlot(str, result=str)
     def syncLibraryToCura(self, requested_path: str) -> str:
         """Install missing published materials and machine instances into this Cura profile."""
-        material_stats = {"installed": 0, "existing": 0, "unpublished": 0, "builtin-missing": 0, "failed": 0}
+        material_stats = {"installed": 0, "updated": 0, "existing": 0, "unpublished": 0, "builtin-missing": 0, "failed": 0}
         machine_stats = {"installed": 0, "existing": 0, "unpublished": 0, "missing-definition": 0, "failed": 0}
         quality_stats = {"installed": 0, "updated": 0, "existing": 0, "local-newer": 0, "deleted": 0, "deleted-existing": 0, "deletion-conflict": 0, "conflict": 0, "name-conflict": 0, "failed": 0}
         failures = []
@@ -3207,10 +3321,10 @@ class EventideSharedProfiles(QObject, Extension):
             self._refresh_library_state_internal(require_manifest=True)
             self.refreshSelection()
             self._last_sync_summary = (
-                "SYNC: materials +{} / {} local; machines +{} / {} local; "
+                "SYNC: materials +{} / {} updated / {} local; machines +{} / {} local; "
                 "quality +{} / {} updated / {} local / {} deleted; {} conflict(s); {} failure(s)."
             ).format(
-                material_stats.get("installed", 0), material_stats.get("existing", 0),
+                material_stats.get("installed", 0), material_stats.get("updated", 0), material_stats.get("existing", 0),
                 machine_stats.get("installed", 0), machine_stats.get("existing", 0),
                 quality_stats.get("installed", 0), quality_stats.get("updated", 0), quality_stats.get("existing", 0), quality_stats.get("deleted", 0),
                 quality_stats.get("conflict", 0) + quality_stats.get("deletion-conflict", 0) + quality_stats.get("name-conflict", 0), len(failures),
