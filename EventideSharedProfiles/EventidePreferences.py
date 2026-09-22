@@ -32,6 +32,7 @@ class EventidePreferences:
             "toolhead_bindings": "{}",
             "machine_bindings": "{}",
             "quality_sync_state": "{}",
+            "material_sync_state": "{}",
             "migration_complete": False,
         }
         for name, default in defaults.items():
@@ -119,6 +120,7 @@ class EventidePreferences:
             "toolhead_bindings": self._dict_of_strings(self._json_preference("toolhead_bindings")),
             "machine_bindings": self._dict_of_strings(self._json_preference("machine_bindings")),
             "quality_sync_state": self._dict_of_dicts(self._json_preference("quality_sync_state")),
+            "material_sync_state": self._dict_of_dicts(self._json_preference("material_sync_state")),
         }
 
     def save(
@@ -129,9 +131,11 @@ class EventidePreferences:
         toolhead_bindings: Dict[str, str],
         machine_bindings: Dict[str, str],
         quality_sync_state: Dict[str, Dict[str, Any]],
+        material_sync_state: Any = None,
     ) -> None:
         self._preferences.setValue(self._key("shared_library_path"), shared_library_path)
         self._preferences.setValue(self._key("client_id"), client_id)
         self._preferences.setValue(self._key("toolhead_bindings"), json.dumps(toolhead_bindings, sort_keys=True, separators=(",", ":")))
         self._preferences.setValue(self._key("machine_bindings"), json.dumps(machine_bindings, sort_keys=True, separators=(",", ":")))
         self._preferences.setValue(self._key("quality_sync_state"), json.dumps(quality_sync_state, sort_keys=True, separators=(",", ":")))
+        self._preferences.setValue(self._key("material_sync_state"), json.dumps(material_sync_state or {}, sort_keys=True, separators=(",", ":")))
